@@ -67,6 +67,22 @@ struct Args {
     /// Number of producer/consumer threads
     #[arg(short, long)]
     threads: Option<i32>,
+
+    /// Test the Knight Rider animation without connecting to Kafka
+    #[arg(long)]
+    test_animation: bool,
+
+    /// Duration in seconds for animation test
+    #[arg(long, default_value = "30")]
+    animation_duration: u64,
+
+    /// Speed of the animation (lower is faster) in milliseconds
+    #[arg(long, default_value = "20")]
+    animation_speed: u64,
+
+    /// Maximum simulated throughput rate for animation test
+    #[arg(long, default_value = "10000")]
+    animation_max_rate: f64,
 }
 
 /// Represents the size configuration for test messages
@@ -503,12 +519,13 @@ impl ThroughputMeasurer {
     /// * `max_rate` - Maximum observed rate (for normalization)
     fn knight_rider_animation(&self, position: usize, rate: f64, min_rate: f64, max_rate: f64) {
         /// Number of LEDs in the display bar
-        const LED_COUNT: usize = 20;
+        const LED_COUNT: usize = 50;
         /// ANSI color codes for different LED intensities
-        const RED: &str = "\x1b[1;91m";
-        const BRIGHT_RED: &str = "\x1b[38;5;196m";
-        #[allow(dead_code)]
-        const DIM_RED: &str = "\x1b[38;5;124m";
+        const BRIGHT_RED: &str = "\x1b[38;5;196m"; // Core bright red
+        const RED: &str = "\x1b[38;5;160m"; // Standard red
+        const DIM_RED_1: &str = "\x1b[38;5;124m"; // Dim red (level 1)
+        const DIM_RED_2: &str = "\x1b[38;5;88m"; // Dimmer red (level 2)
+        const DIM_RED_3: &str = "\x1b[38;5;52m"; // Dimmest red (level 3)
         const RESET: &str = "\x1b[0m";
 
         // Initialize display with empty spaces
@@ -517,21 +534,36 @@ impl ThroughputMeasurer {
         // Create the moving LED pattern with performance-based color intensity
         // Main LED (brightest) - shows current position
         if position < LED_COUNT {
-            display[position] = format!("{}█{}", BRIGHT_RED, RESET);
+            display[position] = format!("{}●{}", BRIGHT_RED, RESET);
         }
-        // Trailing LEDs with decreasing intensity (creates comet tail effect)
-        if position > 0 && position - 1 < LED_COUNT {
-            display[position - 1] = format!("{}▓{}", RED, RESET);
+
+        // Create a more gradual fade effect with multiple intensity levels
+        // Trailing LEDs (comet tail effect)
+        for i in 1..7 {
+            if position >= i && position - i < LED_COUNT {
+                let color = match i {
+                    1 => BRIGHT_RED,
+                    2 => RED,
+                    3 => RED,
+                    4 => DIM_RED_1,
+                    5 => DIM_RED_2,
+                    _ => DIM_RED_3,
+                };
+                display[position - i] = format!("{}●{}", color, RESET);
+            }
         }
-        if position > 1 && position - 2 < LED_COUNT {
-            display[position - 2] = format!("{}░{}", RED, RESET);
-        }
-        // Leading LEDs with decreasing intensity (creates comet head effect)
-        if position + 1 < LED_COUNT {
-            display[position + 1] = format!("{}▓{}", RED, RESET);
-        }
-        if position + 2 < LED_COUNT {
-            display[position + 2] = format!("{}░{}", RED, RESET);
+
+        // Leading LEDs (comet head effect)
+        for i in 1..5 {
+            if position + i < LED_COUNT {
+                let color = match i {
+                    1 => RED,
+                    2 => DIM_RED_1,
+                    3 => DIM_RED_2,
+                    _ => DIM_RED_3,
+                };
+                display[position + i] = format!("{}●{}", color, RESET);
+            }
         }
 
         // Combine LED elements into a single display string
@@ -649,13 +681,12 @@ impl ThroughputMeasurer {
         let final_received = self.messages_received.load(Ordering::Relaxed);
         let total_duration = start_time.elapsed().as_secs_f64();
 
-        // Overall average rate across the entire measurement period
-        let final_received_rate = (final_received - start_received) as f64 / total_duration;
-
-        // Handle case where no valid rates were recorded
-        if min_rate == f64::MAX {
-            min_rate = 0.0;
-        }
+        // Calculate overall throughput (messages per second)
+        let final_received_rate = if total_duration > 0.0 {
+            (final_received - start_received) as f64 / total_duration
+        } else {
+            0.0
+        };
 
         info!(
             "{} completed - Final throughput: {:.1} msg/s (min: {:.1}, max: {:.1})",
@@ -663,6 +694,112 @@ impl ThroughputMeasurer {
         );
 
         (min_rate, max_rate)
+    }
+
+    /// Test function for the Knight Rider animation
+    ///
+    /// This function runs a simulated animation test with varying rates
+    /// to showcase the Knight Rider LED effect without connecting to Kafka
+    ///
+    /// # Arguments
+    /// * `duration_secs` - How long the animation should run, in seconds
+    /// * `base_speed_ms` - Base animation speed in milliseconds (lower is faster)
+    /// * `max_rate_value` - Maximum simulated throughput rate for the animation
+    pub async fn run_animation_test(duration_secs: u64, base_speed_ms: u64, max_rate_value: f64) {
+        println!("Running Knight Rider animation test...");
+        println!(
+            "Duration: {}s, Base speed: {}ms, Max rate: {}",
+            duration_secs, base_speed_ms, max_rate_value
+        );
+        println!("Press Ctrl+C to exit");
+
+        let measurer = ThroughputMeasurer::new();
+        let duration = Duration::from_secs(duration_secs);
+        let start = Instant::now();
+        let mut position = 0;
+        let mut direction = 1;
+        let led_count = 50; // Match the LED_COUNT from knight_rider_animation
+
+        // Simulated rate variables
+        let mut rate: f64;
+        let mut min_rate: f64 = f64::MAX;
+        let mut max_rate: f64 = 0.0;
+        let half_max_rate = max_rate_value / 2.0;
+
+        // Animation pattern options
+        let patterns = ["sine", "sawtooth", "square", "pulse"];
+        let mut current_pattern = 0;
+        let pattern_duration = Duration::from_secs(5);
+        let mut pattern_start = start;
+
+        while start.elapsed() < duration {
+            // Switch patterns every few seconds
+            if pattern_start.elapsed() >= pattern_duration {
+                current_pattern = (current_pattern + 1) % patterns.len();
+                pattern_start = Instant::now();
+                println!("\nSwitching to {} wave pattern", patterns[current_pattern]);
+            }
+
+            // Create different wave patterns for the simulated throughput rate
+            let elapsed = start.elapsed().as_secs_f64();
+            let pattern_progress =
+                pattern_start.elapsed().as_secs_f64() / pattern_duration.as_secs_f64();
+
+            rate = match patterns[current_pattern] {
+                // Sine wave: smooth oscillation
+                "sine" => half_max_rate + half_max_rate * (elapsed * 0.2).sin(),
+
+                // Sawtooth wave: linear ramp up, instant drop
+                "sawtooth" => {
+                    let saw_val = pattern_progress % 1.0;
+                    saw_val * max_rate_value
+                }
+
+                // Square wave: alternating between min and max
+                "square" => {
+                    if (elapsed * 0.2).sin() >= 0.0 {
+                        max_rate_value
+                    } else {
+                        max_rate_value * 0.1
+                    }
+                }
+
+                // Pulse wave: occasional spikes
+                "pulse" => {
+                    let pulse_val = (elapsed * 2.0).sin();
+                    if pulse_val > 0.9 {
+                        max_rate_value
+                    } else {
+                        max_rate_value * 0.2
+                    }
+                }
+
+                // Default to sine wave
+                _ => half_max_rate + half_max_rate * (elapsed * 0.2).sin(),
+            };
+
+            // Update min/max
+            min_rate = min_rate.min(rate);
+            max_rate = max_rate.max(rate);
+
+            // Update animation position
+            measurer.knight_rider_animation(position, rate, min_rate, max_rate);
+
+            // Move position and handle direction changes
+            position = (position as i32 + direction) as usize;
+            if position >= led_count - 1 {
+                direction = -1;
+            } else if position == 0 {
+                direction = 1;
+            }
+
+            // Adjust speed based on simulated rate
+            let speed_factor = 1.0 - (rate / max_rate_value).min(1.0).max(0.0);
+            let delay_ms = base_speed_ms + (speed_factor * 80.0) as u64;
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+        println!("\nAnimation test completed!");
     }
 }
 
@@ -682,6 +819,18 @@ async fn main() -> Result<()> {
 
     // Parse and validate command-line arguments
     let args = Args::parse();
+
+    // If test_animation is enabled, run animation test and exit
+    if args.test_animation {
+        ThroughputMeasurer::run_animation_test(
+            args.animation_duration,
+            args.animation_speed,
+            args.animation_max_rate,
+        )
+        .await;
+        return Ok(());
+    }
+
     let message_size = MessageSize::parse(&args.message_size)?;
     let mut num_threads = args.threads.unwrap_or(args.partitions) as usize;
 
