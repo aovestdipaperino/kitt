@@ -16,8 +16,8 @@ use kafka_protocol::{
     protocol::StrBytes,
     records::{Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
 };
+use kitt_throbbler::KnightRiderAnimator;
 use rand::{thread_rng, Rng};
-use std::io::{self, Write};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -49,19 +49,15 @@ struct Args {
     broker: String,
 
     /// Number of partitions for the test topic
-    #[arg(short, long, default_value = "4")]
+    #[arg(short, long, default_value = "8")]
     partitions: i32,
 
     /// Message size in bytes (e.g., "1024") or range (e.g., "100-1000")
     #[arg(short, long, default_value = "1024")]
     message_size: String,
 
-    /// Replication factor for the test topic
-    #[arg(short, long, default_value = "1")]
-    replication_factor: i16,
-
     /// Measurement duration in seconds
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value = "30")]
     measurement_secs: u64,
 
     /// Number of producer/consumer threads
@@ -478,75 +474,18 @@ struct ThroughputMeasurer {
     messages_sent: Arc<AtomicU64>,
     /// Atomic counter for total messages received by all consumer threads
     messages_received: Arc<AtomicU64>,
+    /// Knight Rider animator for visual feedback
+    animator: KnightRiderAnimator,
 }
 
 impl ThroughputMeasurer {
-    /// Creates a new ThroughputMeasurer with counters initialized to zero
-    fn new() -> Self {
+    /// Creates a new ThroughputMeasurer with custom LED count
+    fn with_leds(led_count: usize) -> Self {
         Self {
             messages_sent: Arc::new(AtomicU64::new(0)),
             messages_received: Arc::new(AtomicU64::new(0)),
+            animator: KnightRiderAnimator::with_leds(led_count),
         }
-    }
-
-    /// Creates a Knight Rider-style animated display showing throughput performance
-    ///
-    /// The animation shows a moving LED pattern where:
-    /// - Position indicates time progression
-    /// - LED color intensity reflects current throughput rate
-    /// - The pattern bounces back and forth across the display
-    ///
-    /// # Arguments
-    /// * `position` - Current animation position (0 to LED_COUNT-1)
-    /// * `rate` - Current throughput rate (messages/second)
-    /// * `min_rate` - Minimum observed rate (for normalization)
-    /// * `max_rate` - Maximum observed rate (for normalization)
-    fn knight_rider_animation(&self, position: usize, rate: f64, min_rate: f64, max_rate: f64) {
-        /// Number of LEDs in the display bar
-        const LED_COUNT: usize = 20;
-        /// ANSI color codes for different LED intensities
-        const RED: &str = "\x1b[1;91m";
-        const BRIGHT_RED: &str = "\x1b[38;5;196m";
-        #[allow(dead_code)]
-        const DIM_RED: &str = "\x1b[38;5;124m";
-        const RESET: &str = "\x1b[0m";
-
-        // Initialize display with empty spaces
-        let mut display = vec![" ".to_string(); LED_COUNT];
-
-        // Create the moving LED pattern with performance-based color intensity
-        // Main LED (brightest) - shows current position
-        if position < LED_COUNT {
-            display[position] = format!("{}█{}", BRIGHT_RED, RESET);
-        }
-        // Trailing LEDs with decreasing intensity (creates comet tail effect)
-        if position > 0 && position - 1 < LED_COUNT {
-            display[position - 1] = format!("{}▓{}", RED, RESET);
-        }
-        if position > 1 && position - 2 < LED_COUNT {
-            display[position - 2] = format!("{}░{}", RED, RESET);
-        }
-        // Leading LEDs with decreasing intensity (creates comet head effect)
-        if position + 1 < LED_COUNT {
-            display[position + 1] = format!("{}▓{}", RED, RESET);
-        }
-        if position + 2 < LED_COUNT {
-            display[position + 2] = format!("{}░{}", RED, RESET);
-        }
-
-        // Combine LED elements into a single display string
-        let pattern: String = display.join("");
-        // Print animated throughput display with carriage return for in-place updates
-        print!(
-            "\r[{}] {:.0} msg/s (min: {:.0}, max: {:.0})      ",
-            pattern,
-            rate,
-            // Handle uninitialized min_rate (f64::MAX) by showing 0
-            if min_rate > 1e9 { 0.0 } else { min_rate },
-            max_rate
-        );
-        // Force immediate output to terminal (bypass buffering)
-        io::stdout().flush().unwrap();
     }
 
     /// Measures throughput over a specified duration with real-time visual feedback
@@ -596,9 +535,9 @@ impl ThroughputMeasurer {
                     // Update Knight Rider animation position with bouncing behavior
                     position = if direction > 0 {
                         // Moving right: bounce off right edge
-                        if position >= 19 {
+                        if position >= 49 { // Updated to match LED_COUNT-1
                             direction = -1;
-                            18
+                            48 // One position before the edge
                         } else {
                             position + 1
                         }
@@ -613,7 +552,7 @@ impl ThroughputMeasurer {
                     };
 
                     // Update the visual display with current metrics
-                    self.knight_rider_animation(position, current_rate, min_rate, max_rate);
+                    self.animator.draw_frame(position, direction, current_rate, min_rate, max_rate);
                 }
                 _ = rate_interval.tick() => {
                     // Calculate instantaneous throughput rate
@@ -649,13 +588,12 @@ impl ThroughputMeasurer {
         let final_received = self.messages_received.load(Ordering::Relaxed);
         let total_duration = start_time.elapsed().as_secs_f64();
 
-        // Overall average rate across the entire measurement period
-        let final_received_rate = (final_received - start_received) as f64 / total_duration;
-
-        // Handle case where no valid rates were recorded
-        if min_rate == f64::MAX {
-            min_rate = 0.0;
-        }
+        // Calculate overall throughput (messages per second)
+        let final_received_rate = if total_duration > 0.0 {
+            (final_received - start_received) as f64 / total_duration
+        } else {
+            0.0
+        };
 
         info!(
             "{} completed - Final throughput: {:.1} msg/s (min: {:.1}, max: {:.1})",
@@ -682,6 +620,7 @@ async fn main() -> Result<()> {
 
     // Parse and validate command-line arguments
     let args = Args::parse();
+
     let message_size = MessageSize::parse(&args.message_size)?;
     let mut num_threads = args.threads.unwrap_or(args.partitions) as usize;
 
@@ -722,7 +661,7 @@ async fn main() -> Result<()> {
 
     // Create topic
     admin_client
-        .create_topic(&topic_name, args.partitions, args.replication_factor)
+        .create_topic(&topic_name, args.partitions, 1)
         .await
         .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
 
@@ -731,7 +670,7 @@ async fn main() -> Result<()> {
     sleep(Duration::from_secs(3)).await;
 
     // Initialize components
-    let measurer = ThroughputMeasurer::new();
+    let measurer = ThroughputMeasurer::with_leds(50);
 
     // Reset message counters
     measurer.messages_sent.store(0, Ordering::Relaxed);
