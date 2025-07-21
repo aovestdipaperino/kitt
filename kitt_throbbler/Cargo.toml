@@ -1,0 +1,10 @@
+[package]
+name = "kitt_throbbler"
+version = "0.1.0"
+edition = "2021"
+description = "A Knight Rider style LED animation for terminal output"
+authors = ["KITT"]
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
