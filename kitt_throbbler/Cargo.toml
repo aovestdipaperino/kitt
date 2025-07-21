@@ -3,8 +3,12 @@ name = "kitt_throbbler"
 version = "0.1.0"
 edition = "2021"
 description = "A Knight Rider style LED animation for terminal output"
-authors = ["KITT"]
+authors = ["Enzo Lombardi <enzo@example.com>"]
 license = "MIT"
+documentation = "https://docs.rs/kitt_throbbler"
+homepage = "https://github.com/enzolombardi/kitt"
+repository = "https://github.com/enzolombardi/kitt"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
