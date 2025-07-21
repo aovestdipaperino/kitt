@@ -128,7 +128,7 @@ impl KnightRiderAnimator {
         // Create the moving LED pattern with performance-based color intensity
         // Main LED (brightest) - shows current position
         if position < self.led_count {
-            display[position] = format!("{}●{}", BRIGHT_RED, RESET);
+            display[position] = format!("{}█{}", BRIGHT_RED, RESET);
         }
 
         // Create a more gradual fade effect with multiple intensity levels
@@ -167,7 +167,7 @@ impl KnightRiderAnimator {
                     10 => DIM_RED_3,
                     _ => "\x1b[38;5;52;2m", // Extra dim red with reduced intensity
                 };
-                display[trail_pos] = format!("{}●{}", color, RESET);
+                display[trail_pos] = format!("{}█{}", color, RESET);
             }
         }
 
@@ -181,7 +181,7 @@ impl KnightRiderAnimator {
             } else {
                 BRIGHT_RED
             };
-            display[position] = format!("{}●{}", main_color, RESET);
+            display[position] = format!("{}█{}", main_color, RESET);
         }
 
         // Combine LED elements into a single display string
