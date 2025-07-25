@@ -634,6 +634,8 @@ async fn main() -> Result<()> {
         num_threads = args.partitions as usize;
     }
 
+    println!("{}", include_str!("logo.txt"));
+
     if num_threads == 0 {
         return Err(anyhow!("Thread count must be at least 1"));
     }
