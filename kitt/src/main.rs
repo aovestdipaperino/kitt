@@ -586,7 +586,7 @@ impl ThroughputMeasurer {
 async fn main() -> Result<()> {
     // Initialize structured logging for better observability
     tracing_subscriber::fmt::init();
-
+    println!("{}", include_str!("logo.txt"));
     // Parse and validate command-line arguments
     let args = Args::parse();
 
