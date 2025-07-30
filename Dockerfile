@@ -10,7 +10,8 @@ RUN apk add --no-cache build-base pkgconfig openssl-dev
 
 # Copy manifests and source
 COPY ./Cargo.toml ./Cargo.lock ./
-COPY ./src ./src
+COPY ./kitt ./kitt
+COPY ./kitt_throbbler ./kitt_throbbler
 
 # Build the release binary
 RUN cargo build --release
