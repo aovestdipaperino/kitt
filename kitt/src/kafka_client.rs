@@ -12,6 +12,8 @@ use kafka_protocol::{
         api_versions_response::ApiVersionsResponse,
         create_topics_request::{CreatableTopic, CreateTopicsRequest},
         delete_topics_request::DeleteTopicsRequest,
+        metadata_request::MetadataRequest,
+        metadata_response::MetadataResponse,
         ApiKey, RequestHeader, ResponseHeader, TopicName,
     },
     protocol::{Decodable, Encodable, StrBytes},
@@ -410,5 +412,40 @@ impl KafkaClient {
         // TODO: Parse response to check for errors (topic not found, not authorized, etc.)
         info!("Successfully deleted topic '{}'", topic);
         Ok(())
+    }
+
+    /// Fetches cluster metadata, including broker and topic information
+    ///
+    /// This method sends a Metadata request to the broker to discover:
+    /// - Cluster topology (brokers, their addresses)
+    /// - Topic details (partitions, leaders, replicas)
+    ///
+    /// # Arguments
+    /// * `topic` - Optional topic name to fetch metadata for. If None, fetches all topics.
+    ///
+    /// # Returns
+    /// * `Ok(MetadataResponse)` - Parsed metadata response from the broker
+    /// * `Err(anyhow::Error)` - If the metadata request fails
+    pub async fn fetch_metadata(&self, topic: Option<&str>) -> Result<MetadataResponse> {
+        debug!("Fetching metadata for topic: {:?}", topic);
+
+        let mut request = MetadataRequest::default();
+        if let Some(topic_name) = topic {
+            let mut topic_request =
+                kafka_protocol::messages::metadata_request::MetadataRequestTopic::default();
+            topic_request.name = Some(TopicName(StrBytes::from_string(topic_name.to_string())));
+            request.topics = Some(vec![topic_request]);
+        }
+
+        let version = self.get_supported_version(ApiKey::Metadata, 1);
+        let response_bytes = self
+            .send_request(ApiKey::Metadata, &request, version)
+            .await?;
+
+        let mut cursor = std::io::Cursor::new(response_bytes.as_ref());
+        let _response_header = ResponseHeader::decode(&mut cursor, 0)?;
+        let response = MetadataResponse::decode(&mut cursor, version)?;
+
+        Ok(response)
     }
 }

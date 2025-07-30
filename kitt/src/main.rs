@@ -19,6 +19,7 @@ use kafka_protocol::{
 use kitt_throbbler::KnightRiderAnimator;
 use rand::{thread_rng, Rng};
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -73,6 +74,10 @@ struct Args {
     /// Legacy threads argument (deprecated, use threads-per-partition instead)
     #[arg(long, hide = true)]
     threads: Option<i32>,
+
+    /// Skip the initial handshake for metadata request
+    #[arg(long)]
+    skip_handshake: bool,
 }
 
 /// Represents the size configuration for test messages
@@ -133,10 +138,6 @@ struct Producer {
     target_partition: i32,
     /// Configuration for message size generation
     message_size: MessageSize,
-    /// Unique identifier for this producer thread (0-based)
-    thread_id: usize,
-    /// Number of threads assigned to the same partition
-    threads_per_partition: usize,
 }
 
 impl Producer {
@@ -147,23 +148,17 @@ impl Producer {
     /// * `topic` - Target topic name for message production
     /// * `target_partition` - Specific partition this producer targets
     /// * `message_size` - Size configuration for generated messages
-    /// * `thread_id` - Unique identifier for this producer thread
-    /// * `threads_per_partition` - Number of threads assigned to the same partition
     fn new(
         client: Arc<KafkaClient>,
         topic: String,
         target_partition: i32,
         message_size: MessageSize,
-        thread_id: usize,
-        threads_per_partition: usize,
     ) -> Self {
         Self {
             client,
             topic,
             target_partition,
             message_size,
-            thread_id,
-            threads_per_partition,
         }
     }
 
@@ -618,7 +613,7 @@ async fn main() -> Result<()> {
     info!("Test topic: {}", topic_name);
 
     // Connect to Kafka for admin operations and discover API versions
-    let admin_client = Arc::new(
+    let mut admin_client = Arc::new(
         KafkaClient::connect(&args.broker)
             .await
             .map_err(|e| anyhow!("Failed to connect admin client: {}", e))?,
@@ -648,25 +643,107 @@ async fn main() -> Result<()> {
     let mut producer_clients = Vec::new();
     let mut consumer_clients = Vec::new();
 
-    info!(
-        "Creating {} producer and consumer connections ({} per partition)...",
-        num_threads, args.threads_per_partition
-    );
-    for i in 0..num_threads {
-        let producer_client = Arc::new(
-            KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
-                .await
-                .map_err(|e| anyhow!("Failed to connect producer client {}: {}", i, e))?,
+    if args.skip_handshake {
+        info!(
+            "Skipping handshake. Creating {} producer and consumer connections to initial broker...",
+            num_threads
         );
-        let consumer_client = Arc::new(
-            KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
-                .await
-                .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
-        );
+        for i in 0..num_threads {
+            let producer_client = Arc::new(
+                KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect producer client {}: {}", i, e))?,
+            );
+            let consumer_client = Arc::new(
+                KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
+            );
+            producer_clients.push(producer_client);
+            consumer_clients.push(consumer_client);
+        }
+    } else {
+        info!("Performing handshake to discover partition leaders...");
+        let metadata = admin_client
+            .fetch_metadata(Some(&topic_name))
+            .await
+            .map_err(|e| anyhow!("Failed to fetch metadata: {}", e))?;
 
-        producer_clients.push(producer_client);
-        consumer_clients.push(consumer_client);
+        // After fetching metadata, we might have a different view of the cluster.
+        // The initial broker might just be a bootstrap server.
+        // Let's check if our initial broker is in the metadata's broker list.
+        let broker_hosts: HashSet<String> = metadata
+            .brokers
+            .iter()
+            .map(|b| format!("{}:{}", b.host.as_str(), b.port))
+            .collect();
+
+        if !broker_hosts.contains(&args.broker) {
+            info!(
+                "Initial broker {} not in cluster metadata. Reconnecting to a cluster member.",
+                args.broker
+            );
+            // The initial broker is not in the list, let's reconnect to one from the metadata
+            if let Some(new_broker_address) = broker_hosts.iter().next() {
+                info!("Reconnecting admin client to {}", new_broker_address);
+                admin_client = Arc::new(
+                    KafkaClient::connect_with_versions(new_broker_address, api_versions.clone())
+                        .await?,
+                );
+            } else {
+                return Err(anyhow!("No brokers found in metadata to reconnect to."));
+            }
+        }
+
+        let topic_metadata = metadata
+            .topics
+            .iter()
+            .find(|t| t.name.as_ref().map(|n| n.as_str()) == Some(topic_name.as_str()))
+            .ok_or_else(|| anyhow!("Topic '{}' not found in metadata", topic_name))?;
+
+        for i in 0..num_threads {
+            let assignment = calculate_thread_assignment(i, args.threads_per_partition as usize);
+            let partition_metadata = topic_metadata
+                .partitions
+                .iter()
+                .find(|p| p.partition_index == assignment.partition_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Partition {} not found for topic '{}'",
+                        assignment.partition_id,
+                        topic_name
+                    )
+                })?;
+
+            let leader_id = partition_metadata.leader_id;
+            let broker = metadata
+                .brokers
+                .iter()
+                .find(|b| b.node_id == leader_id)
+                .ok_or_else(|| anyhow!("Broker with ID {} not found", leader_id.0))?;
+
+            let broker_address = format!("{}:{}", broker.host.as_str(), broker.port);
+            info!(
+                "Thread {} (partition {}) connecting to broker at {}",
+                i, assignment.partition_id, broker_address
+            );
+
+            let producer_client = Arc::new(
+                KafkaClient::connect_with_versions(&broker_address, api_versions.clone())
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect producer client {}: {}", i, e))?,
+            );
+            let consumer_client = Arc::new(
+                KafkaClient::connect_with_versions(&broker_address, api_versions.clone())
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
+            );
+            producer_clients.push(producer_client);
+            consumer_clients.push(consumer_client);
+        }
     }
+
+    info!("All client connections established successfully");
 
     // Create producers and consumers for each thread
     let mut producers = Vec::new();
@@ -681,8 +758,6 @@ async fn main() -> Result<()> {
             topic_name.clone(),
             assignment.partition_id,
             message_size.clone(),
-            i,
-            args.threads_per_partition as usize,
         ));
         consumers.push(Consumer::new(
             consumer_clients[i].clone(),
@@ -692,7 +767,6 @@ async fn main() -> Result<()> {
             args.threads_per_partition as usize,
         ));
     }
-    info!("All client connections established successfully ({} threads per partition across {} partitions)", args.threads_per_partition, args.partitions);
 
     // Measurement phase only (no warmup)
     let measurement_duration = Duration::from_secs(args.measurement_secs);
