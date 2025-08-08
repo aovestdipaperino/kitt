@@ -17,7 +17,7 @@ Kitt creates a temporary Kafka topic and measures the maximum sustainable throug
 - **Direct Protocol Communication**: Uses `kafka-protocol` for efficient, low-level Kafka communication
 - **Balanced Load Testing**: Ensures no backlog accumulation for realistic throughput measurements
 - **Flexible Message Sizing**: Supports both fixed sizes and random ranges
-- **Configurable Partitioning**: Test with multiple partitions for parallel processing
+- **Configurable Partitioning**: Test with configurable partitions per thread for parallel processing
 - **Real-time Monitoring**: Shows throughput metrics every 5 seconds during testing
 - **Automatic Cleanup**: Removes test topics after completion
 
@@ -35,14 +35,14 @@ cargo build --release
 ### Basic Usage
 
 ```bash
-# Test with default settings (localhost:9092, 4 partitions, 1024 byte messages, 4 threads)
+# Test with default settings (localhost:9092, 2 partitions per thread, 1024 byte messages, 4 threads)
 ./target/release/kitt
 
 # Test with custom broker
 ./target/release/kitt --broker kafka-broker:9092
 
-# Test with multiple partitions and threads
-./target/release/kitt --partitions 8 --threads 8
+# Test with multiple partitions per thread and threads
+./target/release/kitt --partitions-per-thread 4 --threads 8
 
 # Test with different message size
 ./target/release/kitt --message-size 4096
@@ -54,13 +54,13 @@ cargo build --release
 # Test with variable message sizes (100-1000 bytes)
 ./target/release/kitt --message-size 100-1000
 
-# Test with custom thread count
-./target/release/kitt --partitions 8 --threads 4
+# Test with custom partitions per thread and thread count
+./target/release/kitt --partitions-per-thread 3 --threads 4
 
 # Full configuration example
 ./target/release/kitt \
   --broker localhost:9092 \
-  --partitions 8 \
+  --partitions-per-thread 4 \
   --threads 8 \
   --message-size 512-2048 \
   --measurement-secs 120
@@ -71,10 +71,10 @@ cargo build --release
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
 | `--broker` | `-b` | `localhost:9092` | Kafka broker address |
-| `--partitions` | `-p` | `4` | Number of partitions for test topic |
+| `--partitions-per-thread` | `-p` | `2` | Number of partitions assigned to each thread |
 | `--message-size` | `-m` | `1024` | Message size in bytes or range (e.g., "100-1000") |
-| `--threads` | `-t` | `same as partitions` | Number of producer/consumer threads |
-| `--measurement-secs` | | `60` | Measurement duration in seconds |
+| `--threads` | `-t` | `4` | Number of producer/consumer threads |
+| `--measurement-secs` | | `15` | Measurement duration in seconds |
 
 ## Message Size Formats
 
@@ -86,8 +86,8 @@ cargo build --release
 
 ```
 2025-07-20T10:00:59.893986Z  INFO kitt: Starting Kitt - Kafka Implementation Throughput Tool
-2025-07-20T10:00:59.894008Z  INFO kitt: Broker: localhost:9092, Partitions: 8, Threads: 8, message size: Fixed(1024)
-2025-07-20T10:00:59.894017Z  INFO kitt: Running for: 60s
+2025-07-20T10:00:59.894008Z  INFO kitt: Broker: localhost:9092, Partitions per thread: 2, Total partitions: 8, Threads: 4, message size: Fixed(1024)
+2025-07-20T10:00:59.894017Z  INFO kitt: Running for: 15s
 2025-07-20T10:00:59.894025Z  INFO kitt: Test topic: kitt-test-c33ae558-715d-4ce7-98f7-c9ff7bb4d3fa
 2025-07-20T10:01:00.109673Z  INFO kitt: Waiting for topic to be ready...
 2025-07-20T10:01:03.121464Z  INFO kitt: Starting MEASUREMENT phase for 60 seconds
@@ -112,9 +112,9 @@ Note: The LED pattern (░▓█▓░) appears in bright, saturated red colors,
 
 1. **Initialization**: Connects to the specified Kafka broker and creates a temporary test topic
 2. **Multi-threaded Operations**: Starts multiple producer and consumer threads in parallel
-   - Each thread handles a subset of partitions for optimal parallel processing
-   - By default, uses the same number of threads as partitions
-   - Threads distribute work evenly across assigned partitions
+   - Each thread is assigned exactly N partitions (no overlap between threads)
+   - Total partitions = partitions_per_thread × number_of_threads
+   - Each thread produces and consumes from its dedicated set of partitions
 3. **Flow Control**: Producers monitor backlog (sent - received messages)
    - When backlog > 1000 messages: producers pause to let consumers catch up
    - When backlog < 1000 messages: producers resume at full speed
@@ -136,7 +136,7 @@ Note: The LED pattern (░▓█▓░) appears in bright, saturated red colors,
 
 - The tool aims to measure sustainable throughput, not peak burst capacity
 - Backlog monitoring ensures consumers can keep up with producers across all threads
-- Multiple partitions combined with multiple threads enable true parallel processing
+- Each thread gets dedicated partitions (no overlap) for true parallel processing
 - **Backlog-based flow control**: Automatically maintains optimal throughput without manual tuning
 - **Visual feedback**: Knight Rider animation provides engaging real-time monitoring
 - Message size affects throughput - smaller messages typically achieve higher message rates
@@ -154,7 +154,7 @@ Note: The LED pattern (░▓█▓░) appears in bright, saturated red colors,
 - Check Kafka ACLs if security is enabled
 
 ### Low Throughput
-- Try increasing the number of partitions
+- Try increasing the number of partitions per thread or number of threads
 - Experiment with different message sizes
 - Check broker configuration and resources
 - Monitor network and disk I/O on the broker

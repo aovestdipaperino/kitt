@@ -19,6 +19,7 @@ use kafka_protocol::{
 use kitt_throbbler::KnightRiderAnimator;
 use rand::{thread_rng, Rng};
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -48,16 +49,20 @@ struct Args {
     #[arg(short, long, default_value = "localhost:9092")]
     broker: String,
 
-    /// Number of partitions for the test topic
-    #[arg(short, long, default_value = "8")]
-    partitions: i32,
+    /// Number of partitions assigned to each producer thread
+    #[arg(short, long, default_value = "1")]
+    producer_partitions_per_thread: i32,
+
+    /// Number of partitions assigned to each consumer thread
+    #[arg(short, long, default_value = "1")]
+    consumer_partitions_per_thread: i32,
 
     /// Message size in bytes (e.g., "1024") or range (e.g., "100-1000")
     #[arg(short, long, default_value = "1024")]
     message_size: String,
 
     /// Measurement duration in seconds
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "15")]
     measurement_secs: u64,
 
     /// Number of producer/consumer threads
@@ -119,14 +124,12 @@ struct Producer {
     client: Arc<KafkaClient>,
     /// Name of the topic to produce messages to
     topic: String,
-    /// Total number of partitions in the topic
-    partitions: i32,
+    /// Number of partitions assigned to this thread
+    producer_partitions_per_thread: i32,
     /// Configuration for message size generation
     message_size: MessageSize,
     /// Unique identifier for this producer thread (0-based)
     thread_id: usize,
-    /// Total number of producer threads running
-    total_threads: usize,
 }
 
 impl Producer {
@@ -135,25 +138,23 @@ impl Producer {
     /// # Arguments
     /// * `client` - Shared Kafka client for network communication
     /// * `topic` - Target topic name for message production
-    /// * `partitions` - Number of partitions in the topic
+    /// * `producer_partitions_per_thread` - Number of partitions assigned to this thread
     /// * `message_size` - Size configuration for generated messages
     /// * `thread_id` - Unique identifier for this producer thread
-    /// * `total_threads` - Total number of producer threads for workload distribution
+    /// * `thread_id` - Unique identifier for this producer thread
     fn new(
         client: Arc<KafkaClient>,
         topic: String,
-        partitions: i32,
+        producer_partitions_per_thread: i32,
         message_size: MessageSize,
         thread_id: usize,
-        total_threads: usize,
     ) -> Self {
         Self {
             client,
             topic,
-            partitions,
+            producer_partitions_per_thread,
             message_size,
             thread_id,
-            total_threads,
         }
     }
 
@@ -180,96 +181,84 @@ impl Producer {
     ) -> Result<()> {
         let end_time = Instant::now() + duration;
 
-        // Distribute partitions evenly across producer threads
-        // Each thread handles a subset of partitions for parallel processing
-        let partitions_per_thread = std::cmp::max(1, self.partitions as usize / self.total_threads);
-        let start_partition = self.thread_id * partitions_per_thread;
-        let end_partition = std::cmp::min(
-            start_partition + partitions_per_thread,
-            self.partitions as usize,
-        );
+        // Each thread handles its assigned partitions (no overlap with other threads)
+        let start_partition = self.thread_id * self.producer_partitions_per_thread as usize;
+        let partition_count = self.producer_partitions_per_thread as usize;
 
-        // Early exit if this thread has no partitions assigned
-        // This can happen when there are more threads than partitions
-        if start_partition >= self.partitions as usize {
-            return Ok(());
-        }
+        // Send 1 message per partition in each batch request
+        const MAX_PENDING: usize = 20; // Maximum concurrent batched requests
 
-        let partition_count = end_partition - start_partition;
-        if partition_count == 0 {
-            return Ok(());
-        }
-
-        // Round-robin through assigned partitions for even distribution
-        let mut partition_offset = 0;
         let mut pending_futures = Vec::new();
-        /// Maximum number of concurrent produce requests to prevent overwhelming the broker
-        const MAX_PENDING: usize = 100;
 
         while Instant::now() < end_time {
             // Implement backpressure control to prevent memory exhaustion
-            // If too many messages are pending (sent but not yet consumed), pause production
             let sent = messages_sent.load(Ordering::Relaxed);
             let received = messages_received.load(Ordering::Relaxed);
             let backlog = sent.saturating_sub(received);
 
             if backlog > MAX_BACKLOG {
                 // Backlog exceeded threshold - pause to let consumers catch up
-                // This prevents OOM conditions during high-throughput testing
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
 
-            // Generate message with configured size (fixed or random within range)
-            let size = self.message_size.generate_size();
-            let payload = vec![b'x'; size]; // Simple payload filled with 'x' characters
-            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+            // Create produce request with 1 message per partition
+            let mut request = ProduceRequest::default();
+            request.acks = -1;
+            request.timeout_ms = 30000;
 
-            // Create a Kafka record with minimal required fields for performance testing
-            let record = Record {
-                transactional: false,      // Not using transactions for simplicity
-                control: false,            // Regular data record, not a control message
-                partition_leader_epoch: 0, // Not tracking leader epochs
-                producer_id: 0,            // Using default producer ID
-                producer_epoch: 0,         // Not using idempotent producer
-                timestamp_type: TimestampType::Creation,
-                offset: 0,                          // Offset will be assigned by broker
-                sequence: 0,                        // Not using sequence numbers
-                timestamp,                          // Current timestamp for latency measurement
-                key: None, // No message key - will use round-robin partitioning
-                value: Some(Bytes::from(payload)), // The actual message payload
-                headers: indexmap::IndexMap::new(), // No custom headers needed
-            };
+            let mut topic_data = TopicProduceData::default();
+            topic_data.name = TopicName(StrBytes::from_string(self.topic.clone()));
 
             // Configure encoding options for the record batch
             let options = RecordEncodeOptions {
-                version: 2,                     // Use version 2 for better performance
-                compression: Compression::None, // No compression for maximum throughput
+                version: 2,
+                compression: Compression::None,
             };
 
-            // Encode the record into a Kafka record batch format
-            let mut batch_buf = bytes::BytesMut::new();
-            RecordBatchEncoder::encode(&mut batch_buf, [&record], &options)?;
-            let batch = batch_buf.freeze();
+            // Create one message for each partition assigned to this thread
+            for i in 0..partition_count {
+                let partition_id = (start_partition + i) as i32;
 
-            // Calculate target partition using round-robin distribution
-            let partition = (start_partition + partition_offset) as i32;
-            let mut partition_data = PartitionProduceData::default();
-            partition_data.index = partition;
-            partition_data.records = Some(batch);
+                // Generate message with configured size
+                let size = self.message_size.generate_size();
+                let payload = vec![b'x'; size];
+                let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
-            // Prepare topic-level data structure for the produce request
-            let mut topic_data = TopicProduceData::default();
-            topic_data.name = TopicName(StrBytes::from_string(self.topic.clone()));
-            topic_data.partition_data.push(partition_data);
+                // Create a Kafka record
+                let record = Record {
+                    transactional: false,
+                    control: false,
+                    partition_leader_epoch: 0,
+                    producer_id: 0,
+                    producer_epoch: 0,
+                    timestamp_type: TimestampType::Creation,
+                    offset: 0,
+                    sequence: 0,
+                    timestamp,
+                    key: None,
+                    value: Some(Bytes::from(payload)),
+                    headers: indexmap::IndexMap::new(),
+                };
 
-            // Create produce request with durability guarantees
-            let mut request = ProduceRequest::default();
-            request.acks = -1; // Wait for all in-sync replicas to acknowledge
-            request.timeout_ms = 30000; // 30-second timeout for request completion
+                // Encode the record into a batch
+                let mut batch_buf = bytes::BytesMut::new();
+                RecordBatchEncoder::encode(&mut batch_buf, [&record], &options)?;
+                let batch = batch_buf.freeze();
+
+                // Create partition data
+                let mut partition_data = PartitionProduceData::default();
+                partition_data.index = partition_id;
+                partition_data.records = Some(batch);
+                topic_data.partition_data.push(partition_data);
+            }
+
             request.topic_data.push(topic_data);
 
-            // Send the produce request asynchronously for high throughput
+            // Track messages before sending (1 per partition)
+            messages_sent.fetch_add(partition_count as u64, Ordering::Relaxed);
+
+            // Send the batched request asynchronously
             let version = self.client.get_supported_version(ApiKey::Produce, 3);
             let client = self.client.clone();
             let future = tokio::spawn(async move {
@@ -279,32 +268,26 @@ impl Producer {
             });
             pending_futures.push(future);
 
-            // Manage concurrent request limit to prevent resource exhaustion
+            // Manage concurrent request limit
             if pending_futures.len() >= MAX_PENDING {
                 let mut i = 0;
                 while i < pending_futures.len() {
                     if pending_futures[i].is_finished() {
                         let result = pending_futures.remove(i).await;
                         if let Err(e) = result {
-                            error!("Failed to send message: {}", e);
+                            error!("Failed to send batch: {}", e);
                         }
                     } else {
                         i += 1;
                     }
                 }
             }
-
-            // Increment global message counter for throughput tracking
-            messages_sent.fetch_add(1, Ordering::Relaxed);
-            // Move to next partition in round-robin fashion for load balancing
-            partition_offset = (partition_offset + 1) % partition_count;
         }
 
-        // Clean up: wait for all remaining async requests to complete
-        // This ensures all messages are sent before the producer shuts down
+        // Clean up: wait for all remaining requests to complete
         for future in pending_futures {
             if let Err(e) = future.await {
-                error!("Failed to complete pending message: {}", e);
+                error!("Failed to complete pending batch: {}", e);
             }
         }
 
@@ -320,12 +303,10 @@ struct Consumer {
     client: Arc<KafkaClient>,
     /// Name of the topic to consume messages from
     topic: String,
-    /// Total number of partitions in the topic
-    partitions: i32,
+    /// Number of partitions assigned to this thread
+    consumer_partitions_per_thread: i32,
     /// Unique identifier for this consumer thread (0-based)
     thread_id: usize,
-    /// Total number of consumer threads running
-    total_threads: usize,
 }
 
 impl Consumer {
@@ -334,22 +315,20 @@ impl Consumer {
     /// # Arguments
     /// * `client` - Shared Kafka client for network communication
     /// * `topic` - Source topic name for message consumption
-    /// * `partitions` - Number of partitions in the topic
+    /// * `consumer_partitions_per_thread` - Number of partitions assigned to this thread
     /// * `thread_id` - Unique identifier for this consumer thread
-    /// * `total_threads` - Total number of consumer threads for workload distribution
+    /// * `thread_id` - Unique identifier for this consumer thread
     fn new(
         client: Arc<KafkaClient>,
         topic: String,
-        partitions: i32,
+        consumer_partitions_per_thread: i32,
         thread_id: usize,
-        total_threads: usize,
     ) -> Self {
         Self {
             client,
             topic,
-            partitions,
+            consumer_partitions_per_thread,
             thread_id,
-            total_threads,
         }
     }
 
@@ -374,25 +353,9 @@ impl Consumer {
     ) -> Result<()> {
         let end_time = Instant::now() + duration;
 
-        // Distribute partitions evenly across consumer threads
-        // Each thread handles a subset of partitions for parallel processing
-        let partitions_per_thread = std::cmp::max(1, self.partitions as usize / self.total_threads);
-        let start_partition = self.thread_id * partitions_per_thread;
-        let end_partition = std::cmp::min(
-            start_partition + partitions_per_thread,
-            self.partitions as usize,
-        );
-
-        // Early exit if this thread has no partitions assigned
-        // This can happen when there are more threads than partitions
-        if start_partition >= self.partitions as usize {
-            return Ok(());
-        }
-
-        let partition_count = end_partition - start_partition;
-        if partition_count == 0 {
-            return Ok(());
-        }
+        // Each thread handles its assigned partitions (no overlap with other threads)
+        let start_partition = self.thread_id * self.consumer_partitions_per_thread as usize;
+        let partition_count = self.consumer_partitions_per_thread as usize;
 
         // Track current offset for each partition this consumer handles
         // Starting from offset 0 (beginning of each partition)
@@ -403,7 +366,8 @@ impl Consumer {
             let mut fetch_partitions = Vec::new();
 
             // Configure fetch parameters for each assigned partition
-            for (idx, partition) in (start_partition..end_partition).enumerate() {
+            for (idx, partition) in (start_partition..start_partition + partition_count).enumerate()
+            {
                 let mut fetch_partition = FetchPartition::default();
                 fetch_partition.partition = partition as i32;
                 fetch_partition.current_leader_epoch = -1; // Don't check leader epoch
@@ -438,13 +402,11 @@ impl Consumer {
                 .await
             {
                 Ok(_response_bytes) => {
-                    // TODO: Parse response to get actual message count
-                    // For now, increment counter assuming each fetch gets one message
-                    // This simplified approach provides basic throughput measurement
+                    // Simple approach: count each successful fetch as 1 message
+                    // This provides basic throughput measurement
                     messages_received.fetch_add(1, Ordering::Relaxed);
 
                     // Advance offsets for next fetch iteration
-                    // In a real implementation, this would be based on actual response parsing
                     for offset in &mut offsets {
                         *offset += 1;
                     }
@@ -622,28 +584,27 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let message_size = MessageSize::parse(&args.message_size)?;
-    let mut num_threads = args.threads.unwrap_or(args.partitions) as usize;
+    let num_producer_threads = args.threads.unwrap_or(4) as usize;
 
-    // Validate and adjust thread count for optimal performance
-    // More threads than partitions leads to idle threads and overhead
-    if num_threads > args.partitions as usize {
-        warn!(
-            "Thread count ({}) exceeds partition count ({}). Limiting threads to partition count for optimal performance.",
-            num_threads, args.partitions
-        );
-        num_threads = args.partitions as usize;
-    }
+    // Calculate total partitions needed based on producer requirements
+    let total_partitions =
+        (args.producer_partitions_per_thread as usize * num_producer_threads) as i32;
+
+    // Calculate number of consumer threads needed to cover all partitions
+    let num_consumer_threads =
+        (total_partitions as usize + args.consumer_partitions_per_thread as usize - 1)
+            / args.consumer_partitions_per_thread as usize;
 
     println!("{}", include_str!("logo.txt"));
 
-    if num_threads == 0 {
+    if num_producer_threads == 0 {
         return Err(anyhow!("Thread count must be at least 1"));
     }
 
     info!("Starting Kitt - Kafka Implementation Throughput Tool");
     info!(
-        "Broker: {}, Partitions: {}, Threads: {}, message size: {:?}",
-        args.broker, args.partitions, num_threads, message_size
+        "Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {} (calculated to cover all partitions), message size: {:?}",
+        args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
     );
     info!("Running for: {}s", args.measurement_secs);
 
@@ -663,7 +624,7 @@ async fn main() -> Result<()> {
 
     // Create topic
     admin_client
-        .create_topic(&topic_name, args.partitions, 1)
+        .create_topic(&topic_name, total_partitions, 1)
         .await
         .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
 
@@ -683,10 +644,10 @@ async fn main() -> Result<()> {
     let mut consumer_clients = Vec::new();
 
     info!(
-        "Creating {} producer and consumer connections...",
-        num_threads
+        "Creating {} producer and {} consumer connections...",
+        num_producer_threads, num_consumer_threads
     );
-    for i in 0..num_threads {
+    for i in 0..num_producer_threads {
         let producer_client = Arc::new(
             KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
                 .await
@@ -702,25 +663,36 @@ async fn main() -> Result<()> {
         consumer_clients.push(consumer_client);
     }
 
+    // Create additional consumer clients if needed
+    for i in num_producer_threads..num_consumer_threads {
+        let consumer_client = Arc::new(
+            KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
+                .await
+                .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
+        );
+        consumer_clients.push(consumer_client);
+    }
+
     // Create producers and consumers for each thread
     let mut producers = Vec::new();
     let mut consumers = Vec::new();
 
-    for i in 0..num_threads {
+    for i in 0..num_producer_threads {
         producers.push(Producer::new(
             producer_clients[i].clone(),
             topic_name.clone(),
-            args.partitions,
+            args.producer_partitions_per_thread,
             message_size.clone(),
             i,
-            num_threads,
         ));
+    }
+
+    for i in 0..num_consumer_threads {
         consumers.push(Consumer::new(
             consumer_clients[i].clone(),
             topic_name.clone(),
-            args.partitions,
+            args.consumer_partitions_per_thread,
             i,
-            num_threads,
         ));
     }
     info!("All client connections established successfully");
@@ -736,7 +708,7 @@ async fn main() -> Result<()> {
     let mut producer_handles = Vec::new();
     let mut consumer_handles = Vec::new();
 
-    for i in 0..num_threads {
+    for i in 0..num_producer_threads {
         let producer = producers[i].clone();
         let messages_sent = measurer.messages_sent.clone();
         let messages_received = measurer.messages_received.clone();
@@ -746,7 +718,9 @@ async fn main() -> Result<()> {
                 .await
         });
         producer_handles.push(producer_handle);
+    }
 
+    for i in 0..num_consumer_threads {
         let consumer = consumers[i].clone();
         let messages_received = measurer.messages_received.clone();
         let consumer_handle = tokio::spawn(async move {
