@@ -94,9 +94,7 @@ impl KnightRiderAnimator {
     ///
     /// * `position` - Current animation position (0 to led_count-1)
     /// * `direction` - Current animation direction (positive = right, negative = left)
-    /// * `rate` - Current rate value to display (e.g., messages/second)
-    /// * `min_rate` - Minimum observed rate (for display)
-    /// * `max_rate` - Maximum observed rate (for display)
+    /// * `status` - Current status to display (e.g., messages/second)
     ///
     /// # Examples
     ///
@@ -104,16 +102,9 @@ impl KnightRiderAnimator {
     /// use kitt_throbbler::KnightRiderAnimator;
     ///
     /// let animator = KnightRiderAnimator::new();
-    /// animator.draw_frame(5, 1, 100.0, 50.0, 150.0);
+    /// animator.draw_frame(5, 1, "100 msg/s (min: 50, max: 150, backlog: 1.0%)");
     /// ```
-    pub fn draw_frame(
-        &self,
-        position: usize,
-        direction: i32,
-        rate: f64,
-        min_rate: f64,
-        max_rate: f64,
-    ) {
+    pub fn draw_frame(&self, position: usize, direction: i32, status: &str) {
         /// ANSI color codes for different LED intensities
         const BRIGHT_RED: &str = "\x1b[38;5;196m"; // Core bright red
         const RED: &str = "\x1b[38;5;160m"; // Standard red
@@ -171,32 +162,12 @@ impl KnightRiderAnimator {
             }
         }
 
-        // Fade the brightest point slightly if rate is lower (dimmer when slower)
-        if position < self.led_count && rate < max_rate * 0.7 {
-            let dim_factor = rate / max_rate;
-            let main_color = if dim_factor < 0.3 {
-                DIM_RED_1
-            } else if dim_factor < 0.5 {
-                RED
-            } else {
-                BRIGHT_RED
-            };
-            display[position] = format!("{}█{}", main_color, RESET);
-        }
-
         // Combine LED elements into a single display string
         let pattern: String = display.join("");
 
         // Print animated throughput display with carriage return for in-place updates
         if self.show_metrics {
-            print!(
-                "\r[{}] {:.0} msg/s (min: {:.0}, max: {:.0})      ",
-                pattern,
-                rate,
-                // Handle uninitialized min_rate (f64::MAX) by showing 0
-                if min_rate > 1e9 { 0.0 } else { min_rate },
-                max_rate
-            );
+            print!("\r[{}] {}      ", pattern, status);
         } else {
             print!("\r[{}]", pattern);
         }
@@ -305,7 +276,13 @@ impl KnightRiderAnimator {
             max_rate = max_rate.max(rate);
 
             // Update animation position
-            self.draw_frame(position, direction, rate, min_rate, max_rate);
+            let status = format!(
+                "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: 0.0%)",
+                rate,
+                if min_rate > 1e9 { 0.0 } else { min_rate },
+                max_rate
+            );
+            self.draw_frame(position, direction, &status);
 
             // Move position and handle direction changes
             position = (position as i32 + direction) as usize;

@@ -12,10 +12,13 @@ use kafka_protocol::{
         fetch_request::{FetchPartition, FetchRequest, FetchTopic},
         fetch_response::FetchResponse,
         produce_request::{PartitionProduceData, ProduceRequest, TopicProduceData},
-        ApiKey, TopicName,
+        ApiKey, ResponseHeader, TopicName,
     },
     protocol::{Decodable, StrBytes},
-    records::{Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType},
+    records::{
+        Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
+        TimestampType,
+    },
 };
 use kitt_throbbler::KnightRiderAnimator;
 use rand::{thread_rng, Rng};
@@ -30,12 +33,26 @@ use tokio::{
     select,
     time::{interval, sleep, Instant},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Maximum number of pending messages allowed before applying backpressure
 /// This prevents memory exhaustion during high-throughput testing
 const MAX_BACKLOG: u64 = 1000;
+
+/// Calculate the Greatest Common Divisor of two numbers
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// Calculate the Least Common Multiple of two numbers
+fn lcm(a: usize, b: usize) -> usize {
+    a * b / gcd(a, b)
+}
 
 mod kafka_client;
 use kafka_client::KafkaClient;
@@ -62,8 +79,8 @@ struct Args {
     message_size: String,
 
     /// Measurement duration in seconds
-    #[arg(long, default_value = "15")]
-    measurement_secs: u64,
+    #[arg(short, long, default_value = "15")]
+    duration_secs: u64,
 
     /// Number of producer/consumer threads
     #[arg(short, long)]
@@ -199,6 +216,8 @@ impl Producer {
             if backlog > MAX_BACKLOG {
                 // Backlog exceeded threshold - pause to let consumers catch up
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                // Yield to allow consumers to continue processing
+                tokio::task::yield_now().await;
                 continue;
             }
 
@@ -361,7 +380,20 @@ impl Consumer {
         // Starting from offset 0 (beginning of each partition)
         let mut offsets = vec![0i64; partition_count];
 
+        // Add periodic logging to track consumer activity
+        let mut last_log_time = Instant::now();
+        let mut fetch_count = 0u64;
+
         while Instant::now() < end_time {
+            // Log at start of each loop iteration to track consumer activity
+            let time_remaining = end_time
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64();
+            debug!(
+                "Consumer thread {} starting fetch loop iteration, time remaining: {:.1}s",
+                self.thread_id, time_remaining
+            );
+
             // Build fetch request for all partitions handled by this consumer
             let mut fetch_partitions = Vec::new();
 
@@ -375,17 +407,30 @@ impl Consumer {
                 fetch_partition.log_start_offset = -1; // Let broker determine log start
                 fetch_partition.partition_max_bytes = 1024 * 1024; // 1MB per partition limit
 
+                debug!(
+                    "Thread {}: requesting partition {} at offset {}",
+                    self.thread_id, partition, offsets[idx]
+                );
                 fetch_partitions.push(fetch_partition);
             }
 
+            debug!(
+                "Thread {}: sending fetch request for {} partitions ({}..{})",
+                self.thread_id,
+                partition_count,
+                start_partition,
+                start_partition + partition_count - 1
+            );
+
             // Configure topic-level fetch parameters
+            let partition_count_for_log = fetch_partitions.len();
             let mut fetch_topic = FetchTopic::default();
             fetch_topic.topic = TopicName(StrBytes::from_string(self.topic.clone()));
             fetch_topic.partitions = fetch_partitions;
 
             // Create fetch request with optimized settings for high throughput
             let mut request = FetchRequest::default();
-            request.max_wait_ms = 100; // Maximum wait time for data availability
+            request.max_wait_ms = 1000; // Maximum wait time for data availability
             request.min_bytes = 1; // Minimum bytes to return (return immediately if any data)
             request.max_bytes = 50 * 1024 * 1024; // 50MB total response size limit
             request.isolation_level = 0; // Read uncommitted (highest performance)
@@ -395,103 +440,253 @@ impl Consumer {
             request.rack_id = StrBytes::from_static_str(""); // No rack awareness
 
             // Send fetch request and process response
+            debug!(
+                "Consumer thread {} sending fetch request for {} partitions",
+                self.thread_id, partition_count_for_log
+            );
             let version = self.client.get_supported_version(ApiKey::Fetch, 4);
-            match self
-                .client
-                .send_request(ApiKey::Fetch, &request, version)
-                .await
+
+            // Add timeout to prevent hanging indefinitely
+            let fetch_timeout = Duration::from_millis(5000); // 5 second timeout
+            match tokio::time::timeout(
+                fetch_timeout,
+                self.client.send_request(ApiKey::Fetch, &request, version),
+            )
+            .await
             {
-                Ok(response_bytes) => {
-                    // Parse the fetch response to count actual messages and advance offsets properly
-                    match FetchResponse::decode(&mut response_bytes.as_ref(), version) {
-                        Ok(fetch_response) => {
-                            let mut total_messages = 0u64;
+                Ok(Ok(response_bytes)) => {
+                    // First decode the response header, then the fetch response payload
+                    let mut response_cursor = std::io::Cursor::new(response_bytes.as_ref());
 
-                            // Process each topic in the response
-                            for topic_response in &fetch_response.responses {
-                                // Process each partition in the topic
-                                for (_partition_idx, partition_response) in
-                                    topic_response.partitions.iter().enumerate()
-                                {
-                                    if partition_response.error_code == 0 {
-                                        // Count records in this partition
-                                        if let Some(records) = &partition_response.records {
-                                            // Parse record batches to count individual messages
-                                            let _records_cursor =
-                                                std::io::Cursor::new(records.as_ref());
-                                            let mut message_count = 0u64;
+                    // Decode response header first
+                    let header_version = ApiKey::Fetch.response_header_version(version);
+                    match ResponseHeader::decode(&mut response_cursor, header_version) {
+                        Ok(_response_header) => {
+                            // Now decode the fetch response payload
+                            match FetchResponse::decode(&mut response_cursor, version) {
+                                Ok(fetch_response) => {
+                                    let mut total_messages = 0u64;
+                                    debug!(
+                                        "Fetch response has {} topics",
+                                        fetch_response.responses.len()
+                                    );
 
-                                            // Count records by estimating from the records data
-                                            // For simplicity, assume each fetch with non-empty records contains at least 1 message
-                                            if !records.is_empty() {
-                                                // Try to parse the high water mark from partition response to advance offset
-                                                let partition_id =
-                                                    partition_response.partition_index as usize;
-                                                let local_partition_idx = partition_id
-                                                    - (self.thread_id
-                                                        * self.consumer_partitions_per_thread
-                                                            as usize);
+                                    // Process each topic in the response
+                                    for topic_response in &fetch_response.responses {
+                                        debug!(
+                                            "Topic has {} partitions",
+                                            topic_response.partitions.len()
+                                        );
 
+                                        // Process each partition in the topic
+                                        for partition_response in &topic_response.partitions {
+                                            let partition_id =
+                                                partition_response.partition_index as usize;
+                                            let local_partition_idx = partition_id
+                                                - (self.thread_id
+                                                    * self.consumer_partitions_per_thread as usize);
+
+                                            let current_offset =
                                                 if local_partition_idx < offsets.len() {
-                                                    // Use high water mark if available, otherwise advance by 1
-                                                    if partition_response.high_watermark
-                                                        > offsets[local_partition_idx]
+                                                    offsets[local_partition_idx]
+                                                } else {
+                                                    -1
+                                                };
+
+                                            debug!(
+                                                "Partition {}: error_code={}, has_records={}, records_len={}, high_watermark={}, current_offset={}",
+                                                partition_id,
+                                                partition_response.error_code,
+                                                partition_response.records.is_some(),
+                                                partition_response.records.as_ref().map(|r| r.len()).unwrap_or(0),
+                                                partition_response.high_watermark,
+                                                current_offset
+                                            );
+
+                                            if partition_response.error_code == 0
+                                                && local_partition_idx < offsets.len()
+                                            {
+                                                // Check if we got any records
+                                                if let Some(records) = &partition_response.records {
+                                                    if !records.is_empty() {
+                                                        // Parse record batches to count actual records
+                                                        let mut records_cursor =
+                                                            std::io::Cursor::new(records.as_ref());
+                                                        let mut partition_message_count = 0u64;
+
+                                                        // Decode all record batches in this partition
+                                                        while records_cursor.position()
+                                                            < records.len() as u64
+                                                        {
+                                                            match RecordBatchDecoder::decode(
+                                                                &mut records_cursor,
+                                                            ) {
+                                                                Ok(record_set) => {
+                                                                    partition_message_count +=
+                                                                        record_set.records.len()
+                                                                            as u64;
+                                                                    debug!(
+                                                                        "Decoded record batch with {} records",
+                                                                        record_set.records.len()
+                                                                    );
+                                                                }
+                                                                Err(e) => {
+                                                                    debug!(
+                                                                        "Failed to decode record batch: {}",
+                                                                        e
+                                                                    );
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if partition_message_count > 0 {
+                                                            total_messages +=
+                                                                partition_message_count;
+                                                            // Advance offset by the actual number of messages
+                                                            offsets[local_partition_idx] +=
+                                                                partition_message_count as i64;
+                                                        } else {
+                                                            // No messages in record batches - advance by 1 to make progress
+                                                            //offsets[local_partition_idx] += 1;
+                                                        }
+
+                                                        debug!(
+                                                            "Found {} records in partition {}, new offset: {}",
+                                                            partition_message_count,
+                                                            partition_id,
+                                                            offsets[local_partition_idx]
+                                                        );
+                                                    } else {
+                                                        debug!(
+                                                            "Empty records in partition {}, log_start_offset={}, high_watermark={}",
+                                                            partition_id,
+                                                            partition_response.log_start_offset,
+                                                            partition_response.high_watermark
+                                                        );
+                                                        // Empty records - always advance offset to make progress
+                                                        // If we're behind log_start_offset, jump to it; otherwise increment
+                                                        if offsets[local_partition_idx]
+                                                            < partition_response.log_start_offset
+                                                        {
+                                                            offsets[local_partition_idx] =
+                                                                partition_response.log_start_offset;
+                                                        } else if offsets[local_partition_idx]
+                                                            < partition_response.high_watermark
+                                                        {
+                                                            // If there should be messages but we got empty response, advance to high watermark
+                                                            offsets[local_partition_idx] =
+                                                                partition_response.high_watermark;
+                                                        } else {
+                                                            // At or past high watermark, just advance by 1 to keep polling for new messages
+                                                            //offsets[local_partition_idx] += 1;
+                                                        }
+                                                    }
+                                                } else {
+                                                    debug!(
+                                                        "No records field in partition {}",
+                                                        partition_id
+                                                    );
+                                                    // No records field - always advance to make progress
+                                                    if offsets[local_partition_idx]
+                                                        < partition_response.log_start_offset
                                                     {
-                                                        let messages_in_partition =
-                                                            (partition_response.high_watermark
-                                                                - offsets[local_partition_idx])
-                                                                as u64;
-                                                        message_count +=
-                                                            messages_in_partition.min(1000); // Cap to prevent huge jumps
+                                                        offsets[local_partition_idx] =
+                                                            partition_response.log_start_offset;
+                                                    } else if offsets[local_partition_idx]
+                                                        < partition_response.high_watermark
+                                                    {
                                                         offsets[local_partition_idx] =
                                                             partition_response.high_watermark;
                                                     } else {
-                                                        message_count += 1;
                                                         offsets[local_partition_idx] += 1;
                                                     }
                                                 }
+                                            } else if local_partition_idx < offsets.len() {
+                                                if partition_response.error_code != 0 {
+                                                    debug!(
+                                                        "Partition {} has error code: {}",
+                                                        partition_id, partition_response.error_code
+                                                    );
+                                                }
+                                                // Error case or invalid partition - still advance to avoid getting stuck
+                                                offsets[local_partition_idx] += 1;
                                             }
+                                        }
+                                    }
 
-                                            total_messages += message_count;
-                                        }
-                                    } else {
-                                        // Handle partition errors (still advance offset to avoid getting stuck)
-                                        let partition_id =
-                                            partition_response.partition_index as usize;
-                                        let local_partition_idx = partition_id
-                                            - (self.thread_id
-                                                * self.consumer_partitions_per_thread as usize);
-                                        if local_partition_idx < offsets.len() {
-                                            offsets[local_partition_idx] += 1;
-                                        }
+                                    debug!("Total messages found: {}", total_messages);
+                                    // Update metrics with actual message count
+                                    if total_messages > 0 {
+                                        messages_received
+                                            .fetch_add(total_messages, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to decode fetch response payload: {}", e);
+                                    // On decode error, still advance offsets minimally to avoid infinite loop
+                                    for offset in &mut offsets {
+                                        *offset += 1;
                                     }
                                 }
                             }
-
-                            // Update metrics with actual message count
-                            if total_messages > 0 {
-                                messages_received.fetch_add(total_messages, Ordering::Relaxed);
-                            }
                         }
                         Err(e) => {
-                            error!("Failed to decode fetch response: {}", e);
-                            // On decode error, still advance offsets minimally to avoid infinite loop
+                            error!("Failed to decode response header: {}", e);
+                            // On header decode error, still advance offsets minimally to avoid infinite loop
                             for offset in &mut offsets {
                                 *offset += 1;
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Failed to fetch messages: {}", e);
+                Ok(Err(request_err)) => {
+                    error!(
+                        "Consumer thread {} failed to fetch messages: {}",
+                        self.thread_id, request_err
+                    );
                     // Brief pause before retrying to avoid overwhelming broker with failed requests
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    // Yield to allow other tasks to continue processing
+                    tokio::task::yield_now().await;
                 }
+                Err(_timeout_elapsed) => {
+                    error!(
+                        "Consumer thread {} fetch request timed out after 5s",
+                        self.thread_id
+                    );
+                    // Brief pause before retrying to avoid overwhelming broker with failed requests
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    // Yield to allow other tasks to continue processing
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            // Track fetch attempts and log periodically to detect stalling
+            fetch_count += 1;
+            if Instant::now().duration_since(last_log_time) > Duration::from_secs(5) {
+                let current_messages = messages_received.load(Ordering::Relaxed);
+                debug!(
+                    "Consumer thread {}: {} fetch attempts, {} messages received, current offsets: {:?}",
+                    self.thread_id, fetch_count, current_messages, offsets
+                );
+                last_log_time = Instant::now();
+                fetch_count = 0;
             }
 
             // Yield control to allow other tasks to run (cooperative multitasking)
             tokio::task::yield_now().await;
+
+            debug!(
+                "Consumer thread {} completed loop iteration",
+                self.thread_id
+            );
         }
+
+        debug!(
+            "Consumer thread {} exiting after duration completed",
+            self.thread_id
+        );
 
         Ok(())
     }
@@ -557,9 +752,9 @@ impl ThroughputMeasurer {
         let mut position = 0; // Current LED position in the display
         let mut direction = 1; // Animation direction: 1 = right, -1 = left
                                // Throughput tracking variables
-        let mut current_rate = 0.0;
+        let mut current_rate = 0.0f64;
         let mut min_rate = f64::MAX; // Initialize to maximum to find true minimum
-        let mut max_rate = 0.0;
+        let mut max_rate = 0.0f64;
 
         // Main measurement loop with concurrent animation and rate calculation
         while Instant::now() < end_time {
@@ -584,8 +779,23 @@ impl ThroughputMeasurer {
                         }
                     };
 
+                    // Calculate current backlog
+                    let current_sent = self.messages_sent.load(Ordering::Relaxed);
+                    let current_received = self.messages_received.load(Ordering::Relaxed);
+                    let backlog = current_sent.saturating_sub(current_received);
+
+                    // Build status string for display
+                    let backlog_percentage = (backlog as f64 / MAX_BACKLOG as f64 * 100.0).min(100.0);
+                    let status = format!(
+                        "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: {:.1}%)",
+                        current_rate,
+                        if min_rate > 1e9 { 0.0 } else { min_rate },
+                        max_rate,
+                        backlog_percentage
+                    );
+
                     // Update the visual display with current metrics
-                    self.animator.draw_frame(position, direction, current_rate, min_rate, max_rate);
+                    self.animator.draw_frame(position, direction, &status);
                 }
                 _ = rate_interval.tick() => {
                     // Calculate instantaneous throughput rate
@@ -646,6 +856,7 @@ impl ThroughputMeasurer {
 /// 4. Launch producer and consumer threads for parallel processing
 /// 5. Measure and display real-time throughput metrics
 /// 6. Clean up resources and report final results
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize structured logging for better observability
@@ -655,16 +866,20 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let message_size = MessageSize::parse(&args.message_size)?;
-    let num_producer_threads = args.threads.unwrap_or(4) as usize;
+    let base_threads = args.threads.unwrap_or(4) as usize;
 
-    // Calculate total partitions needed based on producer requirements
-    let total_partitions =
-        (args.producer_partitions_per_thread as usize * num_producer_threads) as i32;
+    // Calculate total partitions based on the LCM of partitions per thread to ensure integer thread counts
+    let lcm_partitions_per_thread = lcm(
+        args.producer_partitions_per_thread as usize,
+        args.consumer_partitions_per_thread as usize,
+    );
+    let total_partitions = (lcm_partitions_per_thread * base_threads) as i32;
 
-    // Calculate number of consumer threads needed to cover all partitions
+    // Calculate number of threads needed for each role (now guaranteed to be integers)
+    let num_producer_threads =
+        total_partitions as usize / args.producer_partitions_per_thread as usize;
     let num_consumer_threads =
-        (total_partitions as usize + args.consumer_partitions_per_thread as usize - 1)
-            / args.consumer_partitions_per_thread as usize;
+        total_partitions as usize / args.consumer_partitions_per_thread as usize;
 
     println!("{}", include_str!("logo.txt"));
 
@@ -674,10 +889,10 @@ async fn main() -> Result<()> {
 
     info!("Starting Kitt - Kafka Implementation Throughput Tool");
     info!(
-        "Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {} (calculated to cover all partitions), message size: {:?}",
-        args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
+        "Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, LCM partitions per thread: {}, Base threads: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {} (calculated to cover all partitions), message size: {:?}",
+        args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, lcm_partitions_per_thread, base_threads, total_partitions, num_producer_threads, num_consumer_threads, message_size
     );
-    info!("Running for: {}s", args.measurement_secs);
+    info!("Running for: {}s", args.duration_secs);
 
     // Generate topic name
     let topic_name = format!("kitt-test-{}", Uuid::new_v4());
@@ -718,24 +933,19 @@ async fn main() -> Result<()> {
         "Creating {} producer and {} consumer connections...",
         num_producer_threads, num_consumer_threads
     );
+
+    // Create producer clients
     for i in 0..num_producer_threads {
         let producer_client = Arc::new(
             KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
                 .await
                 .map_err(|e| anyhow!("Failed to connect producer client {}: {}", i, e))?,
         );
-        let consumer_client = Arc::new(
-            KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
-                .await
-                .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
-        );
-
         producer_clients.push(producer_client);
-        consumer_clients.push(consumer_client);
     }
 
-    // Create additional consumer clients if needed
-    for i in num_producer_threads..num_consumer_threads {
+    // Create consumer clients
+    for i in 0..num_consumer_threads {
         let consumer_client = Arc::new(
             KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
                 .await
@@ -769,7 +979,7 @@ async fn main() -> Result<()> {
     info!("All client connections established successfully");
 
     // Measurement phase only (no warmup)
-    let measurement_duration = Duration::from_secs(args.measurement_secs);
+    let measurement_duration = Duration::from_secs(args.duration_secs);
 
     // Reset counters before measurement
     measurer.messages_sent.store(0, Ordering::Relaxed);
@@ -834,4 +1044,84 @@ async fn main() -> Result<()> {
 
     info!("Kitt measurement completed successfully!");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lcm;
+
+    #[test]
+    fn test_partition_and_thread_calculation() {
+        // Test case 1: Equal partitions per thread
+        let producer_partitions_per_thread = 2;
+        let consumer_partitions_per_thread = 2;
+        let base_threads = 4;
+
+        let lcm_partitions_per_thread = lcm(
+            producer_partitions_per_thread,
+            consumer_partitions_per_thread,
+        );
+        let total_partitions = lcm_partitions_per_thread * base_threads;
+        let num_producer_threads = total_partitions / producer_partitions_per_thread;
+        let num_consumer_threads = total_partitions / consumer_partitions_per_thread;
+
+        assert_eq!(total_partitions, 8); // lcm(2,2) * 4 = 2 * 4 = 8
+        assert_eq!(num_producer_threads, 4); // 8/2 = 4
+        assert_eq!(num_consumer_threads, 4); // 8/2 = 4
+
+        // Test case 2: Producer has more partitions per thread
+        let producer_partitions_per_thread = 3;
+        let consumer_partitions_per_thread = 2;
+        let base_threads = 4;
+
+        let lcm_partitions_per_thread = lcm(
+            producer_partitions_per_thread,
+            consumer_partitions_per_thread,
+        );
+        let total_partitions = lcm_partitions_per_thread * base_threads;
+        let num_producer_threads = total_partitions / producer_partitions_per_thread;
+        let num_consumer_threads = total_partitions / consumer_partitions_per_thread;
+
+        assert_eq!(total_partitions, 24); // lcm(3,2) * 4 = 6 * 4 = 24
+        assert_eq!(num_producer_threads, 8); // 24/3 = 8
+        assert_eq!(num_consumer_threads, 12); // 24/2 = 12
+
+        // Test case 3: Consumer has more partitions per thread
+        let producer_partitions_per_thread = 2;
+        let consumer_partitions_per_thread = 3;
+        let base_threads = 4;
+
+        let lcm_partitions_per_thread = lcm(
+            producer_partitions_per_thread,
+            consumer_partitions_per_thread,
+        );
+        let total_partitions = lcm_partitions_per_thread * base_threads;
+        let num_producer_threads = total_partitions / producer_partitions_per_thread;
+        let num_consumer_threads = total_partitions / consumer_partitions_per_thread;
+
+        assert_eq!(total_partitions, 24); // lcm(2,3) * 4 = 6 * 4 = 24
+        assert_eq!(num_producer_threads, 12); // 24/2 = 12
+        assert_eq!(num_consumer_threads, 8); // 24/3 = 8
+
+        // Verify all partitions are covered exactly (no ceiling needed)
+        assert_eq!(num_producer_threads * producer_partitions_per_thread, 24);
+        assert_eq!(num_consumer_threads * consumer_partitions_per_thread, 24);
+
+        // Test case 4: More complex LCM case
+        let producer_partitions_per_thread = 4;
+        let consumer_partitions_per_thread = 6;
+        let base_threads = 2;
+
+        let lcm_partitions_per_thread = lcm(
+            producer_partitions_per_thread,
+            consumer_partitions_per_thread,
+        );
+        let total_partitions = lcm_partitions_per_thread * base_threads;
+        let num_producer_threads = total_partitions / producer_partitions_per_thread;
+        let num_consumer_threads = total_partitions / consumer_partitions_per_thread;
+
+        assert_eq!(total_partitions, 24); // lcm(4,6) * 2 = 12 * 2 = 24
+        assert_eq!(num_producer_threads, 6); // 24/4 = 6
+        assert_eq!(num_consumer_threads, 4); // 24/6 = 4
+    }
 }
