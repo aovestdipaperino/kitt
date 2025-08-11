@@ -28,6 +28,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::Mutex,
+    time::{sleep, Duration},
 };
 use tracing::{debug, info, warn};
 
@@ -75,10 +76,8 @@ impl KafkaClient {
     pub async fn connect(broker: &str) -> Result<Self> {
         info!("Connecting to Kafka broker at {}", broker);
 
-        // Establish TCP connection with detailed error context
-        let stream = TcpStream::connect(broker)
-            .await
-            .map_err(|e| anyhow!("Failed to connect to Kafka broker at {}: {}", broker, e))?;
+        // Establish TCP connection with retry mechanism
+        let stream = Self::connect_with_retry(broker).await?;
 
         info!("Successfully connected to Kafka broker");
 
@@ -128,6 +127,46 @@ impl KafkaClient {
             correlation_id: AtomicU64::new(1),
             api_versions, // Use provided versions instead of discovering
         })
+    }
+
+    /// Attempts to establish TCP connection with retry mechanism
+    ///
+    /// Retries connection every 1 second for up to 10 seconds total
+    async fn connect_with_retry(broker: &str) -> Result<TcpStream> {
+        let max_attempts = 10;
+        let retry_interval = Duration::from_secs(1);
+
+        for attempt in 1..=max_attempts {
+            match TcpStream::connect(broker).await {
+                Ok(stream) => {
+                    if attempt > 1 {
+                        info!(
+                            "Successfully connected to Kafka broker on attempt {}",
+                            attempt
+                        );
+                    }
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    if attempt == max_attempts {
+                        return Err(anyhow!(
+                            "Failed to connect to Kafka broker at {} after {} attempts: {}",
+                            broker,
+                            max_attempts,
+                            e
+                        ));
+                    }
+
+                    warn!(
+                        "Connection attempt {} failed, retrying in 1 second: {}",
+                        attempt, e
+                    );
+                    sleep(retry_interval).await;
+                }
+            }
+        }
+
+        unreachable!("Should have returned from loop")
     }
 
     /// Sends a Kafka protocol request and returns the raw response bytes
