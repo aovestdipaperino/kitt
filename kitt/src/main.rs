@@ -1468,8 +1468,10 @@ struct ThroughputMeasurer {
     messages_sent: Arc<AtomicU64>,
     /// Atomic counter for total messages received by all consumer threads
     messages_received: Arc<AtomicU64>,
-    /// Maximum backlog percentage observed during measurement
-    max_backlog_percentage: Arc<AtomicU64>,
+    /// Sum of all backlog percentage measurements for calculating average
+    backlog_percentage_sum: Arc<AtomicU64>,
+    /// Count of backlog percentage measurements for calculating average
+    backlog_measurement_count: Arc<AtomicU64>,
     /// Knight Rider animator for visual feedback
     animator: KnightRiderAnimator,
 }
@@ -1480,7 +1482,8 @@ impl ThroughputMeasurer {
         Self {
             messages_sent: Arc::new(AtomicU64::new(0)),
             messages_received: Arc::new(AtomicU64::new(0)),
-            max_backlog_percentage: Arc::new(AtomicU64::new(0)),
+            backlog_percentage_sum: Arc::new(AtomicU64::new(0)),
+            backlog_measurement_count: Arc::new(AtomicU64::new(0)),
             animator: KnightRiderAnimator::with_leds(led_count),
         }
     }
@@ -1556,12 +1559,10 @@ impl ThroughputMeasurer {
                     // Build status string for display
                     let backlog_percentage = (backlog as f64 / MAX_BACKLOG as f64 * 100.0).min(100.0);
 
-                    // Track maximum backlog percentage
-                    let current_max = self.max_backlog_percentage.load(Ordering::Relaxed);
+                    // Track backlog percentage for average calculation
                     let backlog_percentage_int = backlog_percentage as u64;
-                    if backlog_percentage_int > current_max {
-                        self.max_backlog_percentage.store(backlog_percentage_int, Ordering::Relaxed);
-                    }
+                    self.backlog_percentage_sum.fetch_add(backlog_percentage_int, Ordering::Relaxed);
+                    self.backlog_measurement_count.fetch_add(1, Ordering::Relaxed);
 
                     let status = format!(
                         "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: {:.1}%)",
@@ -1603,24 +1604,6 @@ impl ThroughputMeasurer {
         }
 
         println!(); // New line after animation completes
-
-        // Calculate final overall throughput statistics
-        let final_received = self.messages_received.load(Ordering::Relaxed);
-        let total_duration = start_time.elapsed().as_secs_f64();
-
-        // Calculate overall throughput (messages per second)
-        let final_received_rate = if total_duration > 0.0 {
-            (final_received - start_received) as f64 / total_duration
-        } else {
-            0.0
-        };
-
-        let max_backlog = self.max_backlog_percentage.load(Ordering::Relaxed);
-        info!(
-            "{} completed - Final throughput: {:.1} msg/s (min: {:.1}, max: {:.1}, max backlog: {}%)",
-            phase, final_received_rate, min_rate, max_rate, max_backlog
-        );
-
         (min_rate, max_rate)
     }
 }
@@ -1863,11 +1846,17 @@ async fn main() -> Result<()> {
             let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
             let final_received = measurer.messages_received.load(Ordering::Relaxed);
             let throughput = final_received as f64 / measurement_duration.as_secs_f64();
-            let max_backlog = measurer.max_backlog_percentage.load(Ordering::Relaxed);
+            let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
+            let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
+            let avg_backlog = if backlog_count > 0 {
+                backlog_sum / backlog_count
+            } else {
+                0
+            };
 
             info!("=== FINAL RESULTS ===");
-            info!("Messages sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, max backlog: {}%)", final_sent, final_received, throughput,
-                min_rate, max_rate, max_backlog
+            info!("Messages sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, avg backlog: {}%)", final_sent, final_received, throughput,
+                min_rate, max_rate, avg_backlog
             );
         }
     });

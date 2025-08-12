@@ -123,7 +123,7 @@ Note: The LED pattern (░▓█▓░) appears in bright, saturated red colors,
    - Real-time throughput rate (msg/s)
    - Running minimum and maximum throughput achieved
 5. **Natural Balance**: System automatically finds sustainable throughput where producers and consumers are balanced
-6. **Results**: Reports final balanced throughput and backlog
+6. **Results**: Reports final balanced throughput and average backlog
 7. **Cleanup**: Automatically deletes the test topic
 
 ## Requirements
