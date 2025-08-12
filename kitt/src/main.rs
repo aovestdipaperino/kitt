@@ -75,6 +75,22 @@ struct Args {
     #[arg(short, long, default_value = "1")]
     consumer_partitions_per_thread: i32,
 
+    /// Number of producer threads
+    #[arg(long, default_value = "4")]
+    producer_threads: i32,
+
+    /// Number of consumer threads
+    #[arg(long, default_value = "4")]
+    consumer_threads: i32,
+
+    /// Use sticky producer-partition assignment with LCM-based partition calculation (legacy mode)
+    #[arg(long, default_value = "false")]
+    sticky: bool,
+
+    /// Number of producer/consumer threads (only used with --sticky mode)
+    #[arg(short, long)]
+    threads: Option<i32>,
+
     /// Message size in bytes (e.g., "1024") or range (e.g., "100-1000")
     #[arg(short, long, default_value = "1024")]
     message_size: String,
@@ -82,10 +98,6 @@ struct Args {
     /// Measurement duration in seconds
     #[arg(short, long, default_value = "15")]
     duration_secs: u64,
-
-    /// Number of producer/consumer threads
-    #[arg(short, long)]
-    threads: Option<i32>,
 
     /// Enable detailed FETCH response diagnostics for troubleshooting
     #[arg(long, default_value = "false")]
@@ -150,12 +162,16 @@ struct Producer {
     client: Arc<KafkaClient>,
     /// Name of the topic to produce messages to
     topic: String,
-    /// Number of partitions assigned to this thread
+    /// Number of partitions this thread will send to per batch
     producer_partitions_per_thread: i32,
+    /// Total number of partitions available for random selection
+    total_partitions: i32,
     /// Configuration for message size generation
     message_size: MessageSize,
     /// Unique identifier for this producer thread (0-based)
     thread_id: usize,
+    /// Whether to use sticky partition assignment (true) or random (false)
+    use_sticky_partitions: bool,
 }
 
 impl Producer {
@@ -164,30 +180,35 @@ impl Producer {
     /// # Arguments
     /// * `client` - Shared Kafka client for network communication
     /// * `topic` - Target topic name for message production
-    /// * `producer_partitions_per_thread` - Number of partitions assigned to this thread
+    /// * `producer_partitions_per_thread` - Number of partitions to send to per batch
+    /// * `total_partitions` - Total number of partitions available for random selection
     /// * `message_size` - Size configuration for generated messages
     /// * `thread_id` - Unique identifier for this producer thread
-    /// * `thread_id` - Unique identifier for this producer thread
+    /// * `use_sticky_partitions` - Whether to use sticky partition assignment
     fn new(
         client: Arc<KafkaClient>,
         topic: String,
         producer_partitions_per_thread: i32,
+        total_partitions: i32,
         message_size: MessageSize,
         thread_id: usize,
+        use_sticky_partitions: bool,
     ) -> Self {
         Self {
             client,
             topic,
             producer_partitions_per_thread,
+            total_partitions,
             message_size,
             thread_id,
+            use_sticky_partitions,
         }
     }
 
     /// Produces messages continuously for the specified duration
     ///
     /// This method implements the core message production loop with:
-    /// - Partition-based load distribution across threads
+    /// - Partition selection (either sticky assignment or random based on configuration)
     /// - Backpressure control to prevent memory exhaustion
     /// - High-throughput batch processing
     ///
@@ -207,9 +228,13 @@ impl Producer {
     ) -> Result<()> {
         let end_time = Instant::now() + duration;
 
-        // Each thread handles its assigned partitions (no overlap with other threads)
-        let start_partition = self.thread_id * self.producer_partitions_per_thread as usize;
+        // Determine partition selection strategy based on configuration
         let partition_count = self.producer_partitions_per_thread as usize;
+        let start_partition = if self.use_sticky_partitions {
+            self.thread_id * self.producer_partitions_per_thread as usize
+        } else {
+            0 // Not used in random mode
+        };
 
         // Send 1 message per partition in each batch request
         const MAX_PENDING: usize = 20; // Maximum concurrent batched requests
@@ -246,9 +271,46 @@ impl Producer {
                 compression: Compression::None,
             };
 
-            // Create one message for each partition assigned to this thread
+            // Create one message for each partition based on assignment strategy
             for i in 0..partition_count {
-                let partition_id = (start_partition + i) as i32;
+                let partition_id = if self.use_sticky_partitions {
+                    // Sticky mode: each thread has fixed partitions
+                    (start_partition + i) as i32
+                } else {
+                    // Random mode: select random partition for each message
+                    if self.total_partitions > 0 {
+                        (rand::random::<u32>() % self.total_partitions as u32) as i32
+                    } else {
+                        error!(
+                            "Producer thread {} has invalid total_partitions: {}",
+                            self.thread_id, self.total_partitions
+                        );
+                        continue;
+                    }
+                };
+
+                // Validate partition ID is within valid range (defensive programming)
+                if partition_id < 0 || partition_id >= self.total_partitions {
+                    error!(
+                        "Producer thread {} generated invalid partition ID {} (valid range: 0-{})",
+                        self.thread_id,
+                        partition_id,
+                        self.total_partitions - 1
+                    );
+                    continue; // Skip this partition and try next iteration
+                }
+
+                debug!(
+                    "Producer thread {} {} partition {} (total partitions: {})",
+                    self.thread_id,
+                    if self.use_sticky_partitions {
+                        "assigned"
+                    } else {
+                        "selecting"
+                    },
+                    partition_id,
+                    self.total_partitions
+                );
 
                 // Generate message with configured size
                 let size = self.message_size.generate_size();
@@ -1406,6 +1468,8 @@ struct ThroughputMeasurer {
     messages_sent: Arc<AtomicU64>,
     /// Atomic counter for total messages received by all consumer threads
     messages_received: Arc<AtomicU64>,
+    /// Maximum backlog percentage observed during measurement
+    max_backlog_percentage: Arc<AtomicU64>,
     /// Knight Rider animator for visual feedback
     animator: KnightRiderAnimator,
 }
@@ -1416,6 +1480,7 @@ impl ThroughputMeasurer {
         Self {
             messages_sent: Arc::new(AtomicU64::new(0)),
             messages_received: Arc::new(AtomicU64::new(0)),
+            max_backlog_percentage: Arc::new(AtomicU64::new(0)),
             animator: KnightRiderAnimator::with_leds(led_count),
         }
     }
@@ -1490,6 +1555,14 @@ impl ThroughputMeasurer {
 
                     // Build status string for display
                     let backlog_percentage = (backlog as f64 / MAX_BACKLOG as f64 * 100.0).min(100.0);
+
+                    // Track maximum backlog percentage
+                    let current_max = self.max_backlog_percentage.load(Ordering::Relaxed);
+                    let backlog_percentage_int = backlog_percentage as u64;
+                    if backlog_percentage_int > current_max {
+                        self.max_backlog_percentage.store(backlog_percentage_int, Ordering::Relaxed);
+                    }
+
                     let status = format!(
                         "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: {:.1}%)",
                         current_rate,
@@ -1542,9 +1615,10 @@ impl ThroughputMeasurer {
             0.0
         };
 
+        let max_backlog = self.max_backlog_percentage.load(Ordering::Relaxed);
         info!(
-            "{} completed - Final throughput: {:.1} msg/s (min: {:.1}, max: {:.1})",
-            phase, final_received_rate, min_rate, max_rate
+            "{} completed - Final throughput: {:.1} msg/s (min: {:.1}, max: {:.1}, max backlog: {}%)",
+            phase, final_received_rate, min_rate, max_rate, max_backlog
         );
 
         (min_rate, max_rate)
@@ -1601,32 +1675,64 @@ async fn main() -> Result<()> {
     }
 
     let message_size = MessageSize::parse(&args.message_size)?;
-    let base_threads = args.threads.unwrap_or(4) as usize;
 
-    // Calculate total partitions based on the LCM of partitions per thread to ensure integer thread counts
-    let lcm_partitions_per_thread = lcm(
-        args.producer_partitions_per_thread as usize,
-        args.consumer_partitions_per_thread as usize,
-    );
-    let total_partitions = (lcm_partitions_per_thread * base_threads) as i32;
+    // Calculate partitions and threads based on mode
+    let (num_producer_threads, num_consumer_threads, total_partitions) = if args.sticky {
+        // Legacy sticky mode: use LCM-based calculation
+        let base_threads = args.threads.unwrap_or(4) as usize;
 
-    // Calculate number of threads needed for each role (now guaranteed to be integers)
-    let num_producer_threads =
-        total_partitions as usize / args.producer_partitions_per_thread as usize;
-    let num_consumer_threads =
-        total_partitions as usize / args.consumer_partitions_per_thread as usize;
+        let lcm_partitions_per_thread = lcm(
+            args.producer_partitions_per_thread as usize,
+            args.consumer_partitions_per_thread as usize,
+        );
+        let total_partitions = (lcm_partitions_per_thread * base_threads) as i32;
+
+        let num_producer_threads =
+            total_partitions as usize / args.producer_partitions_per_thread as usize;
+        let num_consumer_threads =
+            total_partitions as usize / args.consumer_partitions_per_thread as usize;
+
+        (num_producer_threads, num_consumer_threads, total_partitions)
+    } else {
+        // New random mode: consumer-driven partition calculation
+        let num_producer_threads = args.producer_threads as usize;
+        let num_consumer_threads = args.consumer_threads as usize;
+        let total_partitions =
+            (num_consumer_threads * args.consumer_partitions_per_thread as usize) as i32;
+
+        (num_producer_threads, num_consumer_threads, total_partitions)
+    };
 
     println!("{}", include_str!("logo.txt"));
 
     if num_producer_threads == 0 {
-        return Err(anyhow!("Thread count must be at least 1"));
+        return Err(anyhow!("Producer threads must be at least 1"));
+    }
+
+    if num_consumer_threads == 0 {
+        return Err(anyhow!("Consumer threads must be at least 1"));
+    }
+
+    if args.producer_partitions_per_thread <= 0 {
+        return Err(anyhow!("Producer partitions per thread must be at least 1"));
+    }
+
+    if args.consumer_partitions_per_thread <= 0 {
+        return Err(anyhow!("Consumer partitions per thread must be at least 1"));
     }
 
     info!("Starting Kitt - Kafka Implementation Throughput Tool");
-    info!(
-        "Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, LCM partitions per thread: {}, Base threads: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {} (calculated to cover all partitions), message size: {:?}",
-        args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, lcm_partitions_per_thread, base_threads, total_partitions, num_producer_threads, num_consumer_threads, message_size
-    );
+    if args.sticky {
+        info!(
+            "Mode: STICKY (LCM-based) - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
+            args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
+        );
+    } else {
+        info!(
+            "Mode: RANDOM - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
+            args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
+        );
+    }
     info!("Running for: {}s", args.duration_secs);
 
     // Generate topic name
@@ -1698,8 +1804,10 @@ async fn main() -> Result<()> {
             producer_clients[i].clone(),
             topic_name.clone(),
             args.producer_partitions_per_thread,
+            total_partitions,
             message_size.clone(),
             i,
+            args.sticky,
         ));
     }
 
@@ -1752,13 +1860,14 @@ async fn main() -> Result<()> {
         async move {
             let (min_rate, max_rate) = measurer.measure(measurement_duration, "MEASUREMENT").await;
 
-            let total_sent = measurer.messages_sent.load(Ordering::Relaxed);
-            let total_received = measurer.messages_received.load(Ordering::Relaxed);
-            let throughput = total_received as f64 / measurement_duration.as_secs_f64();
+            let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
+            let final_received = measurer.messages_received.load(Ordering::Relaxed);
+            let throughput = final_received as f64 / measurement_duration.as_secs_f64();
+            let max_backlog = measurer.max_backlog_percentage.load(Ordering::Relaxed);
 
             info!("=== FINAL RESULTS ===");
-            info!("Messages sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s)", total_sent, total_received, throughput,
-                min_rate, max_rate
+            info!("Messages sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, max backlog: {}%)", final_sent, final_received, throughput,
+                min_rate, max_rate, max_backlog
             );
         }
     });
@@ -1880,41 +1989,18 @@ mod tests {
 
     #[test]
     fn test_partition_and_thread_calculation() {
-        // Test case 1: Equal partitions per thread
-        let producer_partitions_per_thread = 2;
-        let consumer_partitions_per_thread = 2;
-        let base_threads = 4;
+        // Test case 1: Random mode (new default)
+        let producer_threads = 4;
+        let consumer_threads = 2;
+        let consumer_partitions_per_thread = 3;
 
-        let lcm_partitions_per_thread = lcm(
-            producer_partitions_per_thread,
-            consumer_partitions_per_thread,
-        );
-        let total_partitions = lcm_partitions_per_thread * base_threads;
-        let num_producer_threads = total_partitions / producer_partitions_per_thread;
-        let num_consumer_threads = total_partitions / consumer_partitions_per_thread;
+        let total_partitions = consumer_threads * consumer_partitions_per_thread;
 
-        assert_eq!(total_partitions, 8); // lcm(2,2) * 4 = 2 * 4 = 8
-        assert_eq!(num_producer_threads, 4); // 8/2 = 4
-        assert_eq!(num_consumer_threads, 4); // 8/2 = 4
+        assert_eq!(total_partitions, 6); // 2 * 3 = 6
+        assert_eq!(producer_threads, 4); // Configured directly
+        assert_eq!(consumer_threads, 2); // Configured directly
 
-        // Test case 2: Producer has more partitions per thread
-        let producer_partitions_per_thread = 3;
-        let consumer_partitions_per_thread = 2;
-        let base_threads = 4;
-
-        let lcm_partitions_per_thread = lcm(
-            producer_partitions_per_thread,
-            consumer_partitions_per_thread,
-        );
-        let total_partitions = lcm_partitions_per_thread * base_threads;
-        let num_producer_threads = total_partitions / producer_partitions_per_thread;
-        let num_consumer_threads = total_partitions / consumer_partitions_per_thread;
-
-        assert_eq!(total_partitions, 24); // lcm(3,2) * 4 = 6 * 4 = 24
-        assert_eq!(num_producer_threads, 8); // 24/3 = 8
-        assert_eq!(num_consumer_threads, 12); // 24/2 = 12
-
-        // Test case 3: Consumer has more partitions per thread
+        // Test case 2: Sticky mode (LCM-based legacy)
         let producer_partitions_per_thread = 2;
         let consumer_partitions_per_thread = 3;
         let base_threads = 4;
@@ -1931,11 +2017,7 @@ mod tests {
         assert_eq!(num_producer_threads, 12); // 24/2 = 12
         assert_eq!(num_consumer_threads, 8); // 24/3 = 8
 
-        // Verify all partitions are covered exactly (no ceiling needed)
-        assert_eq!(num_producer_threads * producer_partitions_per_thread, 24);
-        assert_eq!(num_consumer_threads * consumer_partitions_per_thread, 24);
-
-        // Test case 4: More complex LCM case
+        // Test case 3: Complex LCM case
         let producer_partitions_per_thread = 4;
         let consumer_partitions_per_thread = 6;
         let base_threads = 2;
