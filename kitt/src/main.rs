@@ -251,7 +251,7 @@ impl Producer {
                 // Backlog exceeded threshold - pause to let consumers catch up
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 // Yield to allow consumers to continue processing
-                tokio::task::yield_now().await;
+                //tokio::task::yield_now().await;
                 continue;
             }
 
