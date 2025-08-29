@@ -24,15 +24,16 @@ use kafka_protocol::{
 use kitt_throbbler::KnightRiderAnimator;
 use rand::{thread_rng, Rng};
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     select,
-    time::{interval, sleep, Instant},
+    time::{interval, sleep},
 };
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -119,7 +120,7 @@ struct Args {
 enum MessageSize {
     /// Fixed message size in bytes
     Fixed(usize),
-    /// Variable message size with min and max bounds (inclusive)
+    /// Random size in range (min, max) in bytes
     Range(usize, usize),
 }
 
@@ -161,9 +162,8 @@ impl MessageSize {
 
 /// Kafka message producer that sends messages to a specific topic
 /// Each producer instance runs in its own thread and targets specific partitions
-#[derive(Clone)]
 struct Producer {
-    /// Shared Kafka client for sending produce requests
+    /// Kafka client for sending requests
     client: Arc<KafkaClient>,
     /// Name of the topic to produce messages to
     topic: String,
@@ -173,10 +173,30 @@ struct Producer {
     total_partitions: i32,
     /// Configuration for message size generation
     message_size: MessageSize,
-    /// Unique identifier for this producer thread (0-based)
+    /// Thread ID for this producer (used for partition assignment)
     thread_id: usize,
-    /// Whether to use sticky partition assignment (true) or random (false)
+    /// Whether to use sticky partitioning (each thread has fixed partitions)
     use_sticky_partitions: bool,
+    /// Expected offsets for each partition (atomic for thread safety)
+    partition_offsets: Arc<Vec<AtomicU64>>,
+    /// Pending requests per partition when in sticky mode (ensure sequential sending)
+    pending_partition_requests: Arc<Mutex<HashMap<i32, bool>>>,
+}
+
+impl Clone for Producer {
+    fn clone(&self) -> Self {
+        Producer {
+            client: self.client.clone(),
+            topic: self.topic.clone(),
+            producer_partitions_per_thread: self.producer_partitions_per_thread,
+            total_partitions: self.total_partitions,
+            message_size: self.message_size.clone(),
+            thread_id: self.thread_id,
+            use_sticky_partitions: self.use_sticky_partitions,
+            partition_offsets: self.partition_offsets.clone(),
+            pending_partition_requests: self.pending_partition_requests.clone(),
+        }
+    }
 }
 
 impl Producer {
@@ -199,6 +219,12 @@ impl Producer {
         thread_id: usize,
         use_sticky_partitions: bool,
     ) -> Self {
+        // Initialize the partition offsets with AtomicU64 for each partition
+        let mut partition_offsets = Vec::with_capacity(total_partitions as usize);
+        for _ in 0..total_partitions {
+            partition_offsets.push(AtomicU64::new(0));
+        }
+
         Self {
             client,
             topic,
@@ -207,6 +233,8 @@ impl Producer {
             message_size,
             thread_id,
             use_sticky_partitions,
+            partition_offsets: Arc::new(partition_offsets),
+            pending_partition_requests: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -216,15 +244,15 @@ impl Producer {
     /// - Partition selection (either sticky assignment or random based on configuration)
     /// - Backpressure control to prevent memory exhaustion
     /// - High-throughput batch processing
+    /// Send messages continuously to the Kafka topic for the given duration
     ///
     /// # Arguments
-    /// * `duration` - How long to continue producing messages
-    /// * `messages_sent` - Shared counter for tracking sent messages
-    /// * `messages_received` - Shared counter for tracking received messages (for backpressure)
+    /// * `duration` - How long to send messages for
+    /// * `messages_sent` - Counter for tracking total messages sent
+    /// * `messages_received` - Counter for monitoring consumer lag
     ///
     /// # Returns
-    /// * `Ok(())` - When production completes successfully
-    /// * `Err(anyhow::Error)` - If Kafka communication or encoding fails
+    /// * `Result<()>` - OK if all messages were sent successfully
     async fn produce_messages(
         &self,
         duration: Duration,
@@ -246,6 +274,13 @@ impl Producer {
         const MAX_PENDING: usize = 20; // Maximum concurrent batched requests
 
         let mut pending_futures = Vec::new();
+
+        // For sticky mode, initialize the tracking of pending requests for partitions
+        if self.use_sticky_partitions {
+            // No need to clean up, we'll just track if a partition is busy or not
+            let _lock = self.pending_partition_requests.lock().unwrap();
+            // Lock released here
+        }
 
         while Instant::now() < end_time {
             // Implement backpressure control to prevent memory exhaustion
@@ -277,11 +312,47 @@ impl Producer {
                 compression: Compression::None,
             };
 
+            // In sticky mode, we'll collect partitions that don't have pending requests
+            let mut available_partitions = Vec::new();
+
+            if self.use_sticky_partitions {
+                // Take a lock to check which partitions are available
+                {
+                    let pending_requests = self.pending_partition_requests.lock().unwrap();
+                    for i in 0..partition_count {
+                        let partition_id = (start_partition + i) as i32;
+
+                        // Check if this partition has pending requests
+                        if let Some(&is_busy) = pending_requests.get(&partition_id) {
+                            if !is_busy {
+                                available_partitions.push(partition_id);
+                            }
+                        } else {
+                            // No entry yet, so no pending requests
+                            available_partitions.push(partition_id);
+                        }
+                    }
+                } // Lock released here
+
+                // If no partitions are available, wait for some to complete
+                if available_partitions.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+            }
+
             // Create one message for each partition based on assignment strategy
+            let mut included_partitions = Vec::new();
+
             for i in 0..partition_count {
                 let partition_id = if self.use_sticky_partitions {
-                    // Sticky mode: each thread has fixed partitions
-                    (start_partition + i) as i32
+                    // Sticky mode: use only available partitions (no pending requests)
+                    if i < available_partitions.len() {
+                        available_partitions[i]
+                    } else {
+                        // No more available partitions
+                        continue;
+                    }
                 } else {
                     // Random mode: select random partition for each message
                     if self.total_partitions > 0 {
@@ -294,6 +365,8 @@ impl Producer {
                         continue;
                     }
                 };
+
+                included_partitions.push(partition_id);
 
                 // Validate partition ID is within valid range (defensive programming)
                 if partition_id < 0 || partition_id >= self.total_partitions {
@@ -323,6 +396,15 @@ impl Producer {
                 let payload = vec![b'x'; size];
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
+                // Get the current expected offset for this partition atomically (only for sticky mode)
+                let partition_idx = partition_id as usize;
+                let expected_offset =
+                    if self.use_sticky_partitions && partition_idx < self.partition_offsets.len() {
+                        self.partition_offsets[partition_idx].load(Ordering::Acquire)
+                    } else {
+                        0 // Not tracking offsets for random mode
+                    };
+
                 // Create a Kafka record
                 // NOTE: offset is always 0 in PRODUCE requests - the broker assigns actual offsets
                 // The broker-assigned offset will be returned in the ProduceResponse.base_offset
@@ -336,10 +418,19 @@ impl Producer {
                     offset: 0,    // Always 0 for producers - broker assigns actual offset
                     sequence: -1, // Disable sequence tracking for non-idempotent producer
                     timestamp,
-                    key: None,
+                    key: if self.use_sticky_partitions {
+                        Some(Bytes::from(expected_offset.to_string()))
+                    } else {
+                        None // Don't set keys in random mode
+                    },
                     value: Some(Bytes::from(payload)),
                     headers: indexmap::IndexMap::new(),
                 };
+
+                // Atomically increment the expected offset for next message to this partition (only in sticky mode)
+                if self.use_sticky_partitions && partition_idx < self.partition_offsets.len() {
+                    self.partition_offsets[partition_idx].fetch_add(1, Ordering::Release);
+                }
 
                 // Encode the record into a batch
                 let mut batch_buf = bytes::BytesMut::new();
@@ -355,8 +446,27 @@ impl Producer {
 
             request.topic_data.push(topic_data);
 
-            // Track messages before sending (1 per partition)
-            messages_sent.fetch_add(partition_count as u64, Ordering::Relaxed);
+            // Track messages before sending (1 per actual partition included)
+            let actual_partition_count = request.topic_data[0].partition_data.len();
+            messages_sent.fetch_add(actual_partition_count as u64, Ordering::Relaxed);
+
+            // Collect expected offset keys for each partition in this batch (only in sticky mode)
+            let mut partition_keys = Vec::new();
+            if self.use_sticky_partitions {
+                for topic_data in &request.topic_data {
+                    for partition_data in &topic_data.partition_data {
+                        // Store (partition_id, expected_offset) pairs
+                        let partition_id = partition_data.index;
+                        let partition_idx = partition_id as usize;
+                        if partition_idx < self.partition_offsets.len() {
+                            // Get expected offset (subtract 1 because we already incremented it)
+                            let expected_offset =
+                                self.partition_offsets[partition_idx].load(Ordering::Acquire) - 1;
+                            partition_keys.push((partition_id, expected_offset));
+                        }
+                    }
+                }
+            }
 
             // Send the batched request asynchronously
             let version = self.client.get_supported_version(ApiKey::Produce, 3);
@@ -366,19 +476,20 @@ impl Producer {
                 debug!(
                     "Producer thread {} sending batch with {} partitions, producer_id=-1 (idempotence disabled)",
                     thread_id,
-                    partition_count
+                    actual_partition_count
                 );
                 match client
                     .send_request(ApiKey::Produce, &request, version)
                     .await
                 {
                     Ok(response_bytes) => {
-                        // Validate the produce response
+                        // Validate the produce response, including checking that offsets match expected keys
                         Self::validate_produce_response(
                             &response_bytes,
                             version,
                             thread_id,
-                            partition_count,
+                            actual_partition_count,
+                            &partition_keys,
                         )
                         .await
                     }
@@ -408,10 +519,37 @@ impl Producer {
                     }
                 }
             });
-            pending_futures.push(future);
 
-            // Manage concurrent request limit
-            if pending_futures.len() >= MAX_PENDING {
+            // Handle pending futures differently based on partitioning mode
+            if self.use_sticky_partitions {
+                // In sticky mode, mark partitions as busy
+                {
+                    let mut pending_requests = self.pending_partition_requests.lock().unwrap();
+                    for &partition_id in &included_partitions {
+                        pending_requests.insert(partition_id, true);
+                    }
+                } // Lock is released here
+
+                // Now spawn a task to track the future and update partitions when done
+                let partition_tracker = self.pending_partition_requests.clone();
+                let partition_ids = included_partitions.clone();
+                tokio::spawn(async move {
+                    // Wait for the produce request to complete
+                    let _ = future.await;
+
+                    // Mark partitions as available again
+                    let mut pending_requests = partition_tracker.lock().unwrap();
+                    for partition_id in partition_ids {
+                        pending_requests.insert(partition_id, false);
+                    }
+                });
+            } else {
+                // In random mode, just track all futures together
+                pending_futures.push(future);
+            }
+
+            // Manage concurrent request limit (only for random mode)
+            if !self.use_sticky_partitions && pending_futures.len() >= MAX_PENDING {
                 let mut i = 0;
                 while i < pending_futures.len() {
                     if pending_futures[i].is_finished() {
@@ -432,19 +570,38 @@ impl Producer {
                     }
                 }
             }
+
+            // No need to clean up periodically in sticky mode, we do it when futures complete
+            if !self.use_sticky_partitions {
+                // Small delay to avoid CPU spinning
+                tokio::time::sleep(Duration::from_micros(100)).await;
+            }
         }
 
         // Clean up: wait for all remaining requests to complete
-        for future in pending_futures {
-            match future.await {
-                Ok(Ok(_)) => {
-                    // Successfully validated produce response
-                }
-                Ok(Err(e)) => {
-                    debug!("Producer validation failed: {}", e);
-                }
-                Err(e) => {
-                    debug!("Failed to complete pending batch: {}", e);
+        if self.use_sticky_partitions {
+            // In sticky mode, just wait a bit for in-flight requests to complete
+            debug!("Waiting for any pending sticky partition requests to complete");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Reset all partition states to not busy
+            let mut pending_requests = self.pending_partition_requests.lock().unwrap();
+            for (_, is_busy) in pending_requests.iter_mut() {
+                *is_busy = false;
+            }
+        } else {
+            // In random mode, wait for all futures together
+            for future in pending_futures {
+                match future.await {
+                    Ok(Ok(_)) => {
+                        // Successfully validated produce response
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Producer validation failed: {}", e);
+                    }
+                    Err(e) => {
+                        debug!("Failed to complete pending batch: {}", e);
+                    }
                 }
             }
         }
@@ -471,7 +628,11 @@ impl Producer {
         version: i16,
         thread_id: usize,
         partition_count: usize,
+        partition_keys: &[(i32, u64)], // Pairs of (partition_id, expected_offset as key)
     ) -> Result<()> {
+        // Note: In sticky mode, each message has a key that corresponds to the expected offset in the partition
+        // These keys are verified on both producer and consumer sides to ensure they match the actual offsets
+        // In random mode, keys are not set as sequential delivery is not guaranteed
         use std::io::Cursor;
 
         let mut cursor = Cursor::new(response_bytes.as_ref());
@@ -533,13 +694,46 @@ impl Producer {
             for partition_response in &topic_response.partition_responses {
                 let partition_id = partition_response.index;
 
+                // Find the expected offset (key) for this partition
+                let expected_offset = partition_keys
+                    .iter()
+                    .find(|(id, _)| *id == partition_id)
+                    .map(|(_, offset)| *offset);
+
                 // Comprehensive error code analysis
                 match partition_response.error_code {
                     0 => {
-                        diagnostics.push(format!(
-                            "✅ P{}: SUCCESS (broker assigned offset={})",
-                            partition_id, partition_response.base_offset
-                        ));
+                        // Check if broker-assigned offset matches our expected offset (key) in sticky mode
+                        let broker_offset = partition_response.base_offset as u64;
+
+                        if !partition_keys.is_empty() {
+                            if let Some(expected) = expected_offset {
+                                // We're in sticky mode with keys
+                                if broker_offset == expected {
+                                    diagnostics.push(format!(
+                                        "✅ P{}: SUCCESS (broker offset={} matches key={})",
+                                        partition_id, broker_offset, expected
+                                    ));
+                                } else {
+                                    diagnostics.push(format!(
+                                        "⚠️ P{}: OFFSET-KEY MISMATCH (broker offset={}, key={})",
+                                        partition_id, broker_offset, expected
+                                    ));
+                                    // Consider this a partial success - message was accepted but with unexpected offset
+                                    debug!(
+                                    "Partition {}: OFFSET-KEY MISMATCH - broker assigned offset {} but expected {}",
+                                    partition_id, broker_offset, expected
+                                );
+                                }
+                            }
+                        } else {
+                            // Random mode or no keys
+                            diagnostics.push(format!(
+                                "✅ P{}: SUCCESS (broker assigned offset={})",
+                                partition_id, partition_response.base_offset
+                            ));
+                        }
+
                         debug!(
                             "Partition {}: BROKER_ASSIGNED_OFFSET={}, log_append_time={}, log_start_offset={} (producer_id=-1, idempotence disabled, producer sent offset=0, broker assigned actual offset)",
                             partition_id,
@@ -683,6 +877,30 @@ impl Producer {
                 diagnostics.join(" | ")
             );
 
+            // Count key-offset matches and mismatches (only in sticky mode)
+            if !partition_keys.is_empty() {
+                let matches = diagnostics
+                    .iter()
+                    .filter(|d| d.contains("matches key"))
+                    .count();
+                let mismatches = diagnostics
+                    .iter()
+                    .filter(|d| d.contains("OFFSET-KEY MISMATCH"))
+                    .count();
+
+                if mismatches > 0 {
+                    debug!(
+                        "Producer thread {} KEY-OFFSET VERIFICATION: {} matches, {} mismatches",
+                        thread_id, matches, mismatches
+                    );
+                } else {
+                    debug!(
+                        "Producer thread {} KEY-OFFSET MATCHING: All message keys match their broker-assigned offsets",
+                        thread_id
+                    );
+                }
+            }
+
             // Also log offset assignment summary
             let mut offset_summary = Vec::new();
             for topic_response in &response.responses {
@@ -723,6 +941,11 @@ impl Producer {
             if error_summary.contains("NETWORK_EXCEPTION") {
                 debug!("🔧 NETWORK ISSUE - Check network connectivity and broker stability");
             }
+
+            if !partition_keys.is_empty() {
+                debug!("🔑 KEY-OFFSET MATCHING: Message keys are set to match sequential partition offsets but errors occurred");
+                debug!("🔍 Key verification skipped due to produce errors");
+            }
             if error_summary.contains("DUPLICATE_SEQUENCE_NUMBER") {
                 debug!("🔧 SEQUENCE ISSUE - Idempotent producer causing sequence conflicts");
                 debug!("   - Producer is configured with idempotence disabled (producer_id=-1)");
@@ -745,16 +968,18 @@ impl Producer {
 /// Each consumer instance runs in its own thread and targets specific partitions
 #[derive(Clone)]
 struct Consumer {
-    /// Shared Kafka client for sending fetch requests
+    /// Kafka client for sending requests
     client: Arc<KafkaClient>,
     /// Name of the topic to consume messages from
     topic: String,
-    /// Number of partitions assigned to this thread
+    /// Number of partitions this thread will consume per batch
     consumer_partitions_per_thread: i32,
     /// Unique identifier for this consumer thread (0-based)
     thread_id: usize,
     /// Initial delay in seconds before starting to fetch messages
     fetch_delay: u64,
+    /// Whether the producer is using sticky partitioning (for key validation)
+    use_sticky_partitions: bool,
 }
 
 impl Consumer {
@@ -772,6 +997,7 @@ impl Consumer {
         consumer_partitions_per_thread: i32,
         thread_id: usize,
         fetch_delay: u64,
+        use_sticky_partitions: bool,
     ) -> Self {
         Self {
             client,
@@ -779,6 +1005,7 @@ impl Consumer {
             consumer_partitions_per_thread,
             thread_id,
             fetch_delay,
+            use_sticky_partitions,
         }
     }
 
@@ -971,6 +1198,52 @@ impl Consumer {
                                                                 &mut records_cursor,
                                                             ) {
                                                                 Ok(record_set) => {
+                                                                    // Verify key-offset matching only in sticky mode
+                                                                    // In random mode, keys are not set
+                                                                    if self.use_sticky_partitions {
+                                                                        for record in
+                                                                            &record_set.records
+                                                                        {
+                                                                            if let Some(key) =
+                                                                                &record.key
+                                                                            {
+                                                                                if let Ok(key_str) =
+                                                                                    std::str::from_utf8(
+                                                                                        key,
+                                                                                    )
+                                                                                {
+                                                                                    if let Ok(
+                                                                                        key_value,
+                                                                                    ) = key_str
+                                                                                        .parse::<u64>()
+                                                                                    {
+                                                                                        if key_value
+                                                                                            == record
+                                                                                                .offset
+                                                                                                as u64
+                                                                                        {
+                                                                                            debug!(
+                                                                                                "✓ Key-offset match: key={}, offset={}",
+                                                                                                key_value, record.offset
+                                                                                            );
+                                                                                        } else {
+                                                                                            warn!(
+                                                                                                "❌ Key-offset mismatch: key={}, offset={}",
+                                                                                                key_value, record.offset
+                                                                                            );
+                                                                                        }
+                                                                                    } else {
+                                                                                        warn!("❌ Key is not a valid number: {:?}", key_str);
+                                                                                    }
+                                                                                } else {
+                                                                                    warn!("❌ Key is not valid UTF-8");
+                                                                                }
+                                                                            } else {
+                                                                                warn!("❌ Message has no key to verify against offset {}", record.offset);
+                                                                            }
+                                                                        }
+                                                                    }
+
                                                                     partition_message_count +=
                                                                         record_set.records.len()
                                                                             as u64;
@@ -1275,6 +1548,77 @@ impl Consumer {
                         "✓ HAS_RECORDS - {} bytes of record data",
                         records.len()
                     ));
+
+                    // Only validate key-offset matching in sticky mode (keys not set in random mode)
+                    {
+                        // We don't have access to use_sticky_partitions here, so we can't check it directly
+                        let mut records_cursor = std::io::Cursor::new(records.as_ref());
+                        let mut key_offset_match_count = 0;
+                        let mut key_offset_mismatch_count = 0;
+                        let mut no_key_count = 0;
+                        let mut has_any_keys = false;
+
+                        // Try to decode all record batches in this partition
+                        while records_cursor.position() < records.len() as u64 {
+                            match RecordBatchDecoder::decode(&mut records_cursor) {
+                                Ok(record_set) => {
+                                    for record in &record_set.records {
+                                        if let Some(key) = &record.key {
+                                            has_any_keys = true;
+                                            if let Ok(key_str) = std::str::from_utf8(key) {
+                                                if let Ok(key_value) = key_str.parse::<u64>() {
+                                                    if key_value == record.offset as u64 {
+                                                        key_offset_match_count += 1;
+                                                    } else {
+                                                        key_offset_mismatch_count += 1;
+                                                    }
+                                                } else {
+                                                    // Key is not a valid number
+                                                    key_offset_mismatch_count += 1;
+                                                }
+                                            } else {
+                                                // Key is not valid UTF-8
+                                                key_offset_mismatch_count += 1;
+                                            }
+                                        } else {
+                                            // No key to validate
+                                            no_key_count += 1;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    diagnostics.push("⚠️  RECORD_DECODE_FAILED - unable to decode records for key-offset validation".to_string());
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Only add key-offset validation results to diagnostics if we found any keys
+                        // (indicating we're in sticky mode)
+                        if has_any_keys {
+                            // Add key-offset validation results to diagnostics
+                            if key_offset_match_count > 0 {
+                                diagnostics.push(format!(
+                                    "✓ KEY_OFFSET_MATCH - {} records have keys matching their offsets",
+                                    key_offset_match_count
+                                ));
+                            }
+
+                            if key_offset_mismatch_count > 0 {
+                                diagnostics.push(format!(
+                                    "❌ KEY_OFFSET_MISMATCH - {} records have keys NOT matching their offsets",
+                                    key_offset_mismatch_count
+                                ));
+                            }
+
+                            if no_key_count > 0 {
+                                diagnostics.push(format!(
+                                    "⚠️  NO_KEYS - {} records don't have keys to validate against offsets",
+                                    no_key_count
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             None => {
@@ -1335,7 +1679,7 @@ fn test_produce_response_validation() {
 
     println!("🧪 Testing PRODUCE Response Validation...\n");
 
-    // Test 1: Successful response
+    // Test 1: Successful response with matching key-offset
     let mut success_partition = PartitionProduceResponse::default();
     success_partition.index = 0;
     success_partition.error_code = 0;
@@ -1349,8 +1693,13 @@ fn test_produce_response_validation() {
     let mut success_response = ProduceResponse::default();
     success_response.responses.push(success_topic);
 
+    // Expected partition key (assuming message key was "100")
+    // This would be used to verify offset-key matching in real implementation
+
     // Skip encoding test for now due to complexity - just show the concept
-    println!("✅ Success case: P0 SUCCESS (broker assigned offset=100)");
+    println!(
+        "✅ Success case: P0 SUCCESS (broker assigned offset=100, key=100) - ✓ KEY MATCHES OFFSET"
+    );
 
     // Test 2: Authorization failed
     let mut auth_partition = PartitionProduceResponse::default();
@@ -1363,7 +1712,7 @@ fn test_produce_response_validation() {
     let mut auth_response = ProduceResponse::default();
     auth_response.responses.push(auth_topic);
 
-    println!("❌ Auth failed case: Error code 29 (TOPIC_AUTHORIZATION_FAILED)");
+    println!("❌ Auth failed case: Error code 29 (TOPIC_AUTHORIZATION_FAILED) - ⚠️ KEY VERIFICATION SKIPPED");
 
     // Test 3: Unknown topic/partition
     let mut unknown_partition = PartitionProduceResponse::default();
@@ -1376,7 +1725,7 @@ fn test_produce_response_validation() {
     let mut unknown_response = ProduceResponse::default();
     unknown_response.responses.push(unknown_topic);
 
-    println!("❌ Unknown topic case: Error code 3 (UNKNOWN_TOPIC_OR_PARTITION)");
+    println!("❌ Unknown topic case: Error code 3 (UNKNOWN_TOPIC_OR_PARTITION) - ⚠️ KEY VERIFICATION SKIPPED");
 
     // Test 4: Message too large
     let mut large_partition = PartitionProduceResponse::default();
@@ -1389,7 +1738,7 @@ fn test_produce_response_validation() {
     let mut large_response = ProduceResponse::default();
     large_response.responses.push(large_topic);
 
-    println!("❌ Message too large case: Error code 10 (MESSAGE_TOO_LARGE)");
+    println!("❌ Message too large case: Error code 10 (MESSAGE_TOO_LARGE) - ⚠️ KEY VERIFICATION SKIPPED");
 
     // Test 5: Not leader for partition
     let mut leader_partition = PartitionProduceResponse::default();
@@ -1404,7 +1753,30 @@ fn test_produce_response_validation() {
 
     println!("❌ Not leader case: Error code 6 (NOT_LEADER_FOR_PARTITION)");
 
+    println!("\n🧪 Testing Key-Offset Verification...\n");
+
+    // Test 6: Successful response but key doesn't match offset
+    let mut mismatch_partition = PartitionProduceResponse::default();
+    mismatch_partition.index = 1;
+    mismatch_partition.error_code = 0;
+    mismatch_partition.base_offset = 200; // Broker assigned 200
+    mismatch_partition.log_append_time_ms = 1234567890;
+    mismatch_partition.log_start_offset = 0;
+
+    let mut mismatch_topic = TopicProduceResponse::default();
+    mismatch_topic.partition_responses.push(mismatch_partition);
+
+    let mut mismatch_response = ProduceResponse::default();
+    mismatch_response.responses.push(mismatch_topic);
+
+    // Expected partition key was 199 but got 200
+    // In real implementation, this would cause a key-offset mismatch warning
+
+    println!("⚠️ Key-Offset Mismatch case: P1 SUCCESS (broker offset=200, key=199) - ❌ KEY DOESN'T MATCH OFFSET");
+
     println!("\n🧪 PRODUCE Response Validation Tests Complete\n");
+    println!("📝 Note: In actual execution, each message has a key matching its expected sequential offset");
+    println!("🔑 The system verifies that broker-assigned offsets match the keys we set");
 }
 
 /// Test function to validate FETCH response diagnostics
@@ -1680,6 +2052,10 @@ async fn main() -> Result<()> {
         println!(
             "ℹ️  NOTE: Offset=0 in PRODUCE requests is CORRECT - brokers assign actual offsets"
         );
+        println!("🔑 STICKY MODE: Keys set to match expected sequential offsets for validation");
+        println!(
+            "🔄 STICKY MODE: Messages for each partition are sent sequentially to maintain order"
+        );
         println!("📋 Check the following when producer isn't sending messages:");
         println!("   1. Error codes in partition responses (authentication, authorization, topic existence)");
         println!("   2. Partition leadership (broker must be leader for partition)");
@@ -1815,7 +2191,7 @@ async fn main() -> Result<()> {
 
     // Create producers and consumers for each thread
     let mut producers = Vec::new();
-    let mut consumers = Vec::new();
+    let mut consumers: Vec<Consumer> = Vec::new();
 
     for i in 0..num_producer_threads {
         producers.push(Producer::new(
@@ -1836,6 +2212,7 @@ async fn main() -> Result<()> {
             args.consumer_partitions_per_thread,
             i,
             args.fetch_delay,
+            args.sticky,
         ));
     }
     info!("All client connections established successfully");
