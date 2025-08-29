@@ -109,7 +109,7 @@ struct Args {
     debug_produce: bool,
 
     /// Initial delay in seconds before consumers start fetching (helps test backlog handling)
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "5")]
     fetch_delay: u64,
 }
 
