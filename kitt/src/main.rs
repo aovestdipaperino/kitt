@@ -37,9 +37,10 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Maximum number of pending messages allowed before applying backpressure
+/// Base maximum number of pending messages allowed before applying backpressure
 /// This prevents memory exhaustion during high-throughput testing
-const MAX_BACKLOG: u64 = 1000;
+/// Will be multiplied by fetch_delay to compensate for delayed consumer start
+const BASE_MAX_BACKLOG: u64 = 1000;
 
 /// Calculate the Greatest Common Divisor of two numbers
 fn gcd(a: usize, b: usize) -> usize {
@@ -106,6 +107,10 @@ struct Args {
     /// Enable detailed PRODUCE response diagnostics for troubleshooting
     #[arg(long, default_value = "false")]
     debug_produce: bool,
+
+    /// Initial delay in seconds before consumers start fetching (helps test backlog handling)
+    #[arg(long, default_value = "1")]
+    fetch_delay: u64,
 }
 
 /// Represents the size configuration for test messages
@@ -225,6 +230,7 @@ impl Producer {
         duration: Duration,
         messages_sent: Arc<AtomicU64>,
         messages_received: Arc<AtomicU64>,
+        max_backlog: u64,
     ) -> Result<()> {
         let end_time = Instant::now() + duration;
 
@@ -247,7 +253,7 @@ impl Producer {
             let received = messages_received.load(Ordering::Relaxed);
             let backlog = sent.saturating_sub(received);
 
-            if backlog > MAX_BACKLOG {
+            if backlog > max_backlog {
                 // Backlog exceeded threshold - pause to let consumers catch up
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 // Yield to allow consumers to continue processing
@@ -747,6 +753,8 @@ struct Consumer {
     consumer_partitions_per_thread: i32,
     /// Unique identifier for this consumer thread (0-based)
     thread_id: usize,
+    /// Initial delay in seconds before starting to fetch messages
+    fetch_delay: u64,
 }
 
 impl Consumer {
@@ -763,12 +771,14 @@ impl Consumer {
         topic: String,
         consumer_partitions_per_thread: i32,
         thread_id: usize,
+        fetch_delay: u64,
     ) -> Self {
         Self {
             client,
             topic,
             consumer_partitions_per_thread,
             thread_id,
+            fetch_delay,
         }
     }
 
@@ -791,6 +801,15 @@ impl Consumer {
         duration: Duration,
         messages_received: Arc<AtomicU64>,
     ) -> Result<()> {
+        // Apply fetch delay if configured
+        if self.fetch_delay > 0 {
+            info!(
+                "Consumer thread {} waiting {}s before starting to fetch messages",
+                self.thread_id, self.fetch_delay
+            );
+            tokio::time::sleep(Duration::from_secs(self.fetch_delay)).await;
+        }
+
         let end_time = Instant::now() + duration;
 
         // Each thread handles its assigned partitions (no overlap with other threads)
@@ -1496,11 +1515,27 @@ impl ThroughputMeasurer {
     ///
     /// # Arguments
     /// * `duration` - How long to measure throughput
-    /// * `phase` - Description of current test phase (for logging)
+    /// * `label` - Label for display purposes
+    /// * `max_backlog` - Maximum backlog threshold for percentage calculation
+    /// * `fetch_delay` - Initial delay before starting measurement
     ///
     /// # Returns
-    /// * `(min_rate, max_rate)` - Tuple of minimum and maximum observed rates
-    async fn measure(&self, duration: Duration, phase: &str) -> (f64, f64) {
+    /// * `(min_rate, max_rate)` - Tuple containing minimum and maximum measured rates
+    async fn measure(
+        &self,
+        duration: Duration,
+        label: &str,
+        max_backlog: u64,
+        fetch_delay: u64,
+    ) -> (f64, f64) {
+        // Wait for fetch delay before starting measurement
+        if fetch_delay > 0 {
+            info!(
+                "⏱️  Waiting {}s for consumers to start before beginning measurement",
+                fetch_delay
+            );
+            tokio::time::sleep(Duration::from_secs(fetch_delay)).await;
+        }
         let start_time = Instant::now();
         let end_time = start_time + duration;
         // Timer for animation updates (smooth visual feedback)
@@ -1514,8 +1549,8 @@ impl ThroughputMeasurer {
         let mut last_rate_time = start_time;
 
         info!(
-            "Starting {} phase for {} seconds",
-            phase,
+            "🚀 Starting {} phase for {} seconds (after delay)",
+            label,
             duration.as_secs()
         );
         println!(); // Add space for animation
@@ -1557,7 +1592,7 @@ impl ThroughputMeasurer {
                     let backlog = current_sent.saturating_sub(current_received);
 
                     // Build status string for display
-                    let backlog_percentage = (backlog as f64 / MAX_BACKLOG as f64 * 100.0).min(100.0);
+                    let backlog_percentage = (backlog as f64 / max_backlog as f64 * 100.0).min(100.0);
 
                     // Track backlog percentage for average calculation
                     let backlog_percentage_int = backlog_percentage as u64;
@@ -1800,12 +1835,53 @@ async fn main() -> Result<()> {
             topic_name.clone(),
             args.consumer_partitions_per_thread,
             i,
+            args.fetch_delay,
         ));
     }
     info!("All client connections established successfully");
 
-    // Measurement phase only (no warmup)
+    // Calculate adjusted max backlog to compensate for fetch delay
+    let max_backlog = if args.fetch_delay > 0 {
+        let adjusted_backlog = BASE_MAX_BACKLOG * args.fetch_delay;
+        info!(
+            "🔧 Fetch delay compensation enabled: {}s delay",
+            args.fetch_delay
+        );
+        info!(
+            "📊 Max backlog threshold adjusted: {} → {} ({}x multiplier)",
+            BASE_MAX_BACKLOG, adjusted_backlog, args.fetch_delay
+        );
+        info!("💡 This compensates for delayed consumer start by allowing higher backlog buildup");
+        adjusted_backlog
+    } else {
+        BASE_MAX_BACKLOG
+    };
+
+    // Calculate durations accounting for fetch delay
     let measurement_duration = Duration::from_secs(args.duration_secs);
+    let total_test_duration = measurement_duration + Duration::from_secs(args.fetch_delay);
+
+    if args.fetch_delay > 0 {
+        info!(
+            "🕐 Total test duration: {}s ({}s delay + {}s measurement)",
+            total_test_duration.as_secs(),
+            args.fetch_delay,
+            measurement_duration.as_secs()
+        );
+        info!("📋 Test timing:");
+        info!("   1. Producers start immediately and build backlog");
+        info!("   2. Consumers wait {}s before starting", args.fetch_delay);
+        info!("   3. Measurement begins after {}s delay", args.fetch_delay);
+        info!(
+            "   4. Balanced throughput measured for {}s",
+            measurement_duration.as_secs()
+        );
+    } else {
+        info!(
+            "📋 Standard test timing: immediate start, {}s measurement",
+            measurement_duration.as_secs()
+        );
+    }
 
     // Reset counters before measurement
     measurer.messages_sent.store(0, Ordering::Relaxed);
@@ -1821,7 +1897,12 @@ async fn main() -> Result<()> {
         let messages_received = measurer.messages_received.clone();
         let producer_handle = tokio::spawn(async move {
             producer
-                .produce_messages(measurement_duration, messages_sent, messages_received)
+                .produce_messages(
+                    total_test_duration,
+                    messages_sent,
+                    messages_received,
+                    max_backlog,
+                )
                 .await
         });
         producer_handles.push(producer_handle);
@@ -1832,7 +1913,7 @@ async fn main() -> Result<()> {
         let messages_received = measurer.messages_received.clone();
         let consumer_handle = tokio::spawn(async move {
             consumer
-                .consume_messages(measurement_duration, messages_received)
+                .consume_messages(total_test_duration, messages_received)
                 .await
         });
         consumer_handles.push(consumer_handle);
@@ -1841,7 +1922,14 @@ async fn main() -> Result<()> {
     let measurement_handle = tokio::spawn({
         let measurer = measurer.clone();
         async move {
-            let (min_rate, max_rate) = measurer.measure(measurement_duration, "MEASUREMENT").await;
+            let (min_rate, max_rate) = measurer
+                .measure(
+                    measurement_duration,
+                    "MEASUREMENT",
+                    max_backlog,
+                    args.fetch_delay,
+                )
+                .await;
 
             let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
             let final_received = measurer.messages_received.load(Ordering::Relaxed);
@@ -1974,7 +2062,80 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::lcm;
+    use super::{lcm, BASE_MAX_BACKLOG};
+
+    #[test]
+    fn test_fetch_delay_backlog_compensation() {
+        // Test case 1: No delay should use base backlog
+        let fetch_delay = 0u64;
+        let max_backlog = if fetch_delay > 0 {
+            BASE_MAX_BACKLOG * fetch_delay
+        } else {
+            BASE_MAX_BACKLOG
+        };
+        assert_eq!(max_backlog, 1000);
+
+        // Test case 2: 3 second delay should multiply backlog by 3
+        let fetch_delay = 3u64;
+        let max_backlog = if fetch_delay > 0 {
+            BASE_MAX_BACKLOG * fetch_delay
+        } else {
+            BASE_MAX_BACKLOG
+        };
+        assert_eq!(max_backlog, 3000);
+
+        // Test case 3: 10 second delay should multiply backlog by 10
+        let fetch_delay = 10u64;
+        let max_backlog = if fetch_delay > 0 {
+            BASE_MAX_BACKLOG * fetch_delay
+        } else {
+            BASE_MAX_BACKLOG
+        };
+        assert_eq!(max_backlog, 10000);
+    }
+
+    #[test]
+    fn test_measurement_timing_calculation() {
+        use std::time::Duration;
+
+        // Test case 1: No delay - measurement duration equals total duration
+        let measurement_duration = Duration::from_secs(15);
+        let fetch_delay = 0u64;
+        let total_test_duration = measurement_duration + Duration::from_secs(fetch_delay);
+
+        assert_eq!(total_test_duration.as_secs(), 15);
+        assert_eq!(measurement_duration.as_secs(), 15);
+
+        // Test case 2: With delay - total duration includes delay + measurement
+        let measurement_duration = Duration::from_secs(15);
+        let fetch_delay = 3u64;
+        let total_test_duration = measurement_duration + Duration::from_secs(fetch_delay);
+
+        assert_eq!(total_test_duration.as_secs(), 18);
+        assert_eq!(measurement_duration.as_secs(), 15);
+
+        // Test case 3: Extended delay
+        let measurement_duration = Duration::from_secs(20);
+        let fetch_delay = 10u64;
+        let total_test_duration = measurement_duration + Duration::from_secs(fetch_delay);
+
+        assert_eq!(total_test_duration.as_secs(), 30);
+        assert_eq!(measurement_duration.as_secs(), 20);
+    }
+
+    #[test]
+    fn test_fetch_delay_default_value() {
+        use crate::Args;
+        use clap::Parser;
+
+        // Test that default fetch_delay is 1
+        let args = Args::try_parse_from(&["kitt"]).unwrap();
+        assert_eq!(args.fetch_delay, 1);
+
+        // Test custom value works
+        let args = Args::try_parse_from(&["kitt", "--fetch-delay", "5"]).unwrap();
+        assert_eq!(args.fetch_delay, 5);
+    }
 
     #[test]
     fn test_partition_and_thread_calculation() {

@@ -17,6 +17,7 @@ Kitt creates a temporary Kafka topic and measures the maximum sustainable throug
 - **Direct Protocol Communication**: Uses `kafka-protocol` for efficient, low-level Kafka communication
 - **Balanced Load Testing**: Ensures no backlog accumulation for realistic throughput measurements
 - **Flexible Message Sizing**: Supports both fixed sizes and random ranges
+- **Fetch Delay**: Configurable consumer startup delay with automatic backlog compensation
 - **Configurable Partitioning**: Test with configurable partitions per thread for parallel processing
 - **Real-time Monitoring**: Shows throughput metrics every 5 seconds during testing
 - **Automatic Cleanup**: Removes test topics after completion
@@ -46,6 +47,9 @@ cargo build --release
 
 # Test with different message size
 ./target/release/kitt --message-size 4096
+
+# Test with consumer startup delay (useful for backlog testing)
+./target/release/kitt --fetch-delay 3
 ```
 
 ### Advanced Usage
@@ -75,11 +79,37 @@ cargo build --release
 | `--message-size` | `-m` | `1024` | Message size in bytes or range (e.g., "100-1000") |
 | `--threads` | `-t` | `4` | Number of producer/consumer threads |
 | `--measurement-secs` | | `15` | Measurement duration in seconds |
+| `--fetch-delay` | | `1` | Initial delay in seconds before consumers start fetching |
 
 ## Message Size Formats
 
 - **Fixed size**: `1024` - All messages will be exactly 1024 bytes
 - **Range**: `100-1000` - Messages will be randomly sized between 100 and 1000 bytes
+
+## Fetch Delay Feature
+
+The `--fetch-delay` parameter introduces a configurable delay before consumers start fetching messages, which is useful for testing backlog handling scenarios:
+
+- **Purpose**: Simulates scenarios where consumers start after producers (e.g., consumer restarts)
+- **Timing**: Measurement starts AFTER the delay period to measure true balanced throughput
+- **Automatic Compensation**: The max backlog threshold is automatically multiplied by the delay value
+- **Formula**: `max_backlog = BASE_MAX_BACKLOG × fetch_delay` (where BASE_MAX_BACKLOG = 1000)
+- **Use Cases**: Backlog resilience testing, recovery performance measurement, broker stress testing
+
+### Test Flow:
+1. Producers start immediately and build backlog
+2. Consumers wait for the specified delay period
+3. Measurement begins when consumers start fetching
+4. Balanced throughput is measured for the specified duration
+
+### Examples:
+```bash
+# 3-second delay with 3x backlog compensation (3000 messages)
+./target/release/kitt --fetch-delay 3
+
+# Extended delay test with higher backlog tolerance
+./target/release/kitt --fetch-delay 5 --duration-secs 20
+```
 
 ## Output Example
 ### Example Kitt Output
@@ -138,6 +168,7 @@ Note: The LED pattern (░▓█▓░) appears in bright, saturated red colors,
 - Backlog monitoring ensures consumers can keep up with producers across all threads
 - Each thread gets dedicated partitions (no overlap) for true parallel processing
 - **Backlog-based flow control**: Automatically maintains optimal throughput without manual tuning
+- **Fetch delay compensation**: Automatically adjusts backlog thresholds when using consumer delays
 - **Visual feedback**: Knight Rider animation provides engaging real-time monitoring
 - Message size affects throughput - smaller messages typically achieve higher message rates
 - Network latency and broker configuration significantly impact results
