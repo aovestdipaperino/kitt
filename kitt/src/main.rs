@@ -57,7 +57,10 @@ fn lcm(a: usize, b: usize) -> usize {
 }
 
 mod kafka_client;
+pub mod profiling;
 use kafka_client::KafkaClient;
+use profiling::KittOperation;
+use quantum_pulse::profile;
 
 /// Command-line arguments for configuring the throughput test
 #[derive(Parser)]
@@ -111,6 +114,18 @@ struct Args {
     /// Initial delay in seconds before consumers start fetching (helps test backlog handling)
     #[arg(long, default_value = "0")]
     fetch_delay: u64,
+
+    /// Run a profiling demonstration without connecting to Kafka
+    #[arg(long, default_value = "false")]
+    profile_demo: bool,
+
+    /// Enable message validation for produce/consume responses (disabled by default for better performance)
+    #[arg(long, default_value = "false")]
+    message_validation: bool,
+
+    /// Generate and display profiling report at the end (disabled by default)
+    #[arg(long, default_value = "false")]
+    profile_report: bool,
 }
 
 /// Represents the size configuration for test messages
@@ -231,6 +246,7 @@ impl Producer {
         messages_sent: Arc<AtomicU64>,
         messages_received: Arc<AtomicU64>,
         max_backlog: u64,
+        message_validation: bool,
     ) -> Result<()> {
         let end_time = Instant::now() + duration;
 
@@ -255,7 +271,9 @@ impl Producer {
 
             if backlog > max_backlog {
                 // Backlog exceeded threshold - pause to let consumers catch up
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                profile!(KittOperation::BacklogWaiting, {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                });
                 // Yield to allow consumers to continue processing
                 //tokio::task::yield_now().await;
                 continue;
@@ -319,7 +337,9 @@ impl Producer {
                 );
 
                 // Generate message with configured size
-                let size = self.message_size.generate_size();
+                let size = profile!(KittOperation::MessageSizeGeneration, {
+                    self.message_size.generate_size()
+                });
                 let payload = vec![b'x'; size];
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
@@ -368,19 +388,25 @@ impl Producer {
                     thread_id,
                     partition_count
                 );
-                match client
-                    .send_request(ApiKey::Produce, &request, version)
-                    .await
+                match profile!(KittOperation::MessageProduce, {
+                    client.send_request(ApiKey::Produce, &request, version)
+                })
+                .await
                 {
                     Ok(response_bytes) => {
-                        // Validate the produce response
-                        Self::validate_produce_response(
-                            &response_bytes,
-                            version,
-                            thread_id,
-                            partition_count,
-                        )
-                        .await
+                        // Validate the produce response if enabled
+                        if message_validation {
+                            profile!(KittOperation::ResponseValidation, {
+                                Self::validate_produce_response(
+                                    &response_bytes,
+                                    version,
+                                    thread_id,
+                                    partition_count,
+                                )
+                            })
+                            .await?;
+                        }
+                        Ok(())
                     }
                     Err(e) => {
                         error!(
@@ -800,6 +826,7 @@ impl Consumer {
         &self,
         duration: Duration,
         messages_received: Arc<AtomicU64>,
+        message_validation: bool,
     ) -> Result<()> {
         // Apply fetch delay if configured
         if self.fetch_delay > 0 {
@@ -890,7 +917,9 @@ impl Consumer {
             let fetch_timeout = Duration::from_millis(5000); // 5 second timeout
             match tokio::time::timeout(
                 fetch_timeout,
-                self.client.send_request(ApiKey::Fetch, &request, version),
+                profile!(KittOperation::MessageConsume, {
+                    self.client.send_request(ApiKey::Fetch, &request, version)
+                }),
             )
             .await
             {
@@ -933,13 +962,19 @@ impl Consumer {
                                                     -1
                                                 };
 
-                                            // Comprehensive FETCH response validation
-                                            let fetch_diagnostics = Self::validate_fetch_response(
-                                                partition_id,
-                                                &partition_response,
-                                                current_offset,
-                                                self.thread_id,
-                                            );
+                                            // Comprehensive FETCH response validation (if enabled)
+                                            let fetch_diagnostics = if message_validation {
+                                                profile!(KittOperation::ResponseValidation, {
+                                                    Self::validate_fetch_response(
+                                                        partition_id,
+                                                        &partition_response,
+                                                        current_offset,
+                                                        self.thread_id,
+                                                    )
+                                                })
+                                            } else {
+                                                "validation disabled".to_string()
+                                            };
 
                                             debug!(
                                                 "Partition {}: error_code={}, has_records={}, records_len={}, high_watermark={}, current_offset={}, diagnostics={}",
@@ -1655,11 +1690,18 @@ impl ThroughputMeasurer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Profiling is now handled automatically by quantum-pulse
+
     // Initialize structured logging for better observability
     tracing_subscriber::fmt::init();
 
     // Parse and validate command-line arguments
     let args = Args::parse();
+
+    // If profile demo requested, run it and exit
+    if args.profile_demo {
+        return run_profile_demo().await;
+    }
 
     // Run diagnostics tests if requested
     if args.debug_fetch {
@@ -1692,7 +1734,9 @@ async fn main() -> Result<()> {
         println!();
     }
 
-    let message_size = MessageSize::parse(&args.message_size)?;
+    let message_size = profile!(KittOperation::MessageSizeGeneration, {
+        MessageSize::parse(&args.message_size)?
+    });
 
     // Calculate partitions and threads based on mode
     let (num_producer_threads, num_consumer_threads, total_partitions) = if args.sticky {
@@ -1752,6 +1796,13 @@ async fn main() -> Result<()> {
         );
     }
     info!("Running for: {}s", args.duration_secs);
+
+    // Log validation setting
+    if args.message_validation {
+        info!("🔍 Message validation: ENABLED - Response validation will be performed");
+    } else {
+        info!("⚡ Message validation: DISABLED - Optimized for maximum performance");
+    }
 
     // Generate topic name
     let topic_name = format!("kitt-test-{}", Uuid::new_v4());
@@ -1895,6 +1946,7 @@ async fn main() -> Result<()> {
         let producer = producers[i].clone();
         let messages_sent = measurer.messages_sent.clone();
         let messages_received = measurer.messages_received.clone();
+        let message_validation = args.message_validation;
         let producer_handle = tokio::spawn(async move {
             producer
                 .produce_messages(
@@ -1902,6 +1954,7 @@ async fn main() -> Result<()> {
                     messages_sent,
                     messages_received,
                     max_backlog,
+                    message_validation,
                 )
                 .await
         });
@@ -1911,9 +1964,10 @@ async fn main() -> Result<()> {
     for i in 0..num_consumer_threads {
         let consumer = consumers[i].clone();
         let messages_received = measurer.messages_received.clone();
+        let message_validation = args.message_validation;
         let consumer_handle = tokio::spawn(async move {
             consumer
-                .consume_messages(total_test_duration, messages_received)
+                .consume_messages(total_test_duration, messages_received, message_validation)
                 .await
         });
         consumer_handles.push(consumer_handle);
@@ -2057,6 +2111,94 @@ async fn main() -> Result<()> {
     }
 
     info!("Kitt measurement completed successfully!");
+
+    // Generate and display the profiling report if requested
+    if args.profile_report {
+        profiling::generate_report();
+    }
+
+    Ok(())
+}
+
+/// Run a profiling demonstration without connecting to Kafka
+async fn run_profile_demo() -> Result<()> {
+    use rand::random;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    println!("🚀 KITT Profiling Demonstration");
+    println!("================================\n");
+    println!("Simulating various operations to show profiling capabilities...");
+    println!("Note: Message validation is disabled by default for better performance.");
+    println!("Use --message-validation to enable response validation.\n");
+
+    // Simulate message production and consumption operations
+
+    // Simulate producer operations
+    println!("📤 Simulating Producer Operations...");
+    for batch in 0..5 {
+        for _msg in 0..100 {
+            profile!(KittOperation::MessageProduce, {
+                sleep(Duration::from_micros(20)).await;
+            });
+            profile!(KittOperation::MessageSizeGeneration, {
+                sleep(Duration::from_micros(5)).await;
+            });
+            // Only simulate validation if it would be enabled
+            // In real usage, this is controlled by --message-validation flag
+            if random::<bool>() && random::<bool>() {
+                profile!(KittOperation::ResponseValidation, {
+                    sleep(Duration::from_micros(10)).await;
+                });
+            }
+        }
+
+        // Simulate occasional backlog waiting
+        if batch == 2 || batch == 4 {
+            profile!(KittOperation::BacklogWaiting, {
+                sleep(Duration::from_millis(5)).await;
+            });
+        }
+
+        if batch < 4 {
+            print!(".");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        }
+    }
+    println!(" ✓");
+
+    // Simulate consumer operations
+    println!("📥 Simulating Consumer Operations...");
+    for fetch in 0..8 {
+        profile!(KittOperation::MessageConsume, {
+            sleep(Duration::from_millis(30)).await;
+        });
+        // Only simulate validation if it would be enabled
+        if random::<bool>() && random::<bool>() {
+            profile!(KittOperation::ResponseValidation, {
+                sleep(Duration::from_millis(5)).await;
+            });
+        }
+        if fetch < 7 {
+            print!(".");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        }
+    }
+    println!(" ✓");
+
+    // Simulate additional message size generation for variety
+    println!("⚙️  Simulating Additional Processing...");
+    for _i in 0..50 {
+        profile!(KittOperation::MessageSizeGeneration, {
+            sleep(Duration::from_micros(20)).await;
+        });
+    }
+
+    println!("✓ Simulation complete!\n");
+
+    // Always generate the profiling report in demo mode
+    profiling::generate_report();
+
     Ok(())
 }
 
