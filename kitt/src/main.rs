@@ -40,7 +40,7 @@ use uuid::Uuid;
 /// Base maximum number of pending messages allowed before applying backpressure
 /// This prevents memory exhaustion during high-throughput testing
 /// Will be multiplied by fetch_delay to compensate for delayed consumer start
-const BASE_MAX_BACKLOG: u64 = 1000;
+const BASE_MAX_BACKLOG: u64 = 10000;
 
 /// Calculate the Greatest Common Divisor of two numbers
 fn gcd(a: usize, b: usize) -> usize {
@@ -109,7 +109,7 @@ struct Args {
     debug_produce: bool,
 
     /// Initial delay in seconds before consumers start fetching (helps test backlog handling)
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "0")]
     fetch_delay: u64,
 }
 
