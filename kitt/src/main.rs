@@ -22,6 +22,7 @@ use kafka_protocol::{
     },
 };
 use kitt_throbbler::KnightRiderAnimator;
+use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 use std::{
     sync::{
@@ -35,7 +36,6 @@ use tokio::{
     time::{interval, sleep, Instant},
 };
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 /// Base maximum number of pending messages allowed before applying backpressure
 /// This prevents memory exhaustion during high-throughput testing
@@ -1804,8 +1804,27 @@ async fn main() -> Result<()> {
         info!("⚡ Message validation: DISABLED - Optimized for maximum performance");
     }
 
-    // Generate topic name
-    let topic_name = format!("kitt-test-{}", Uuid::new_v4());
+    // Generate topic name using random adjective-noun-verb triplet
+    let adjectives = [
+        "brave", "quick", "silent", "happy", "bright", "calm", "eager", "fierce", "gentle",
+        "jolly", "kind", "lively", "mighty", "proud", "silly", "witty", "zany", "bold", "shy",
+        "wise",
+    ];
+    let nouns = [
+        "cat", "dog", "fox", "owl", "lion", "wolf", "bear", "mouse", "hawk", "fish", "frog",
+        "horse", "duck", "ant", "bee", "bat", "deer", "goat", "rat", "swan",
+    ];
+    let verbs = [
+        "jumps", "runs", "flies", "dives", "sings", "dances", "hops", "swims", "climbs", "rolls",
+        "crawls", "slides", "spins", "laughs", "dreams", "thinks", "waits", "looks", "leaps",
+        "rests",
+    ];
+
+    let mut rng = thread_rng();
+    let adj = adjectives.choose(&mut rng).unwrap();
+    let noun = nouns.choose(&mut rng).unwrap();
+    let verb = verbs.choose(&mut rng).unwrap();
+    let topic_name = format!("topic-{}-{}-{}", adj, noun, verb);
     info!("Test topic: {}", topic_name);
 
     // Connect to Kafka for admin operations and discover API versions
