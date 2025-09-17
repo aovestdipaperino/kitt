@@ -42,6 +42,47 @@ use tracing::{debug, error, info, warn};
 /// Will be multiplied by fetch_delay to compensate for delayed consumer start
 const BASE_MAX_BACKLOG: u64 = 10000;
 
+/// Number of LED positions to move per animation frame
+///
+/// This constant controls how fast the Knight Rider LED animation moves across
+/// the display during throughput measurements.
+///
+/// # Values
+/// - `1`: Classic slow sweep (original KITT speed)
+/// - `2`: Medium speed sweep (current default)
+/// - `3`: Fast sweep for high-activity scenarios
+/// - `4+`: Very fast sweep (may appear choppy)
+///
+/// # Technical Details
+/// The LED moves this many positions every 100ms (animation interval).
+/// Higher values create faster movement but may reduce the visual smoothness
+/// of the scanning effect.
+///
+/// # Usage
+/// This value affects the bounce calculations at display edges and should
+/// be kept reasonable relative to the total LED count (50 positions).
+pub const LED_MOVEMENT_SPEED: usize = 2;
+
+/// Width of the LED bar in number of positions
+///
+/// This constant defines how many LED positions are available in the Knight Rider
+/// animation display during throughput measurements.
+///
+/// # Values
+/// - `30`: Compact display for narrow terminals
+/// - `50`: Standard width (current default)
+/// - `80`: Wide display for detailed visualization
+/// - `100+`: Very wide display (ensure terminal width is sufficient)
+///
+/// # Technical Details
+/// The LED animation bounces between position 0 and (LED_BAR_WIDTH - 1).
+/// Movement speed and bounce calculations are based on this width.
+///
+/// # Usage
+/// This value should be adjusted based on terminal width and visual preference.
+/// Ensure LED_MOVEMENT_SPEED is reasonable relative to this width.
+pub const LED_BAR_WIDTH: usize = 25;
+
 /// Calculate the Greatest Common Divisor of two numbers
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 {
@@ -126,6 +167,10 @@ struct Args {
     /// Generate and display profiling report at the end (disabled by default)
     #[arg(long, default_value = "false")]
     profile_report: bool,
+
+    /// Disable audio playback during animation
+    #[arg(long, default_value = "false")]
+    silent: bool,
 }
 
 /// Represents the size configuration for test messages
@@ -1531,14 +1576,14 @@ struct ThroughputMeasurer {
 }
 
 impl ThroughputMeasurer {
-    /// Creates a new ThroughputMeasurer with custom LED count
-    fn with_leds(led_count: usize) -> Self {
+    /// Creates a new ThroughputMeasurer with custom LED count and audio setting
+    fn with_leds(led_count: usize, audio_enabled: bool) -> Self {
         Self {
             messages_sent: Arc::new(AtomicU64::new(0)),
             messages_received: Arc::new(AtomicU64::new(0)),
             backlog_percentage_sum: Arc::new(AtomicU64::new(0)),
             backlog_measurement_count: Arc::new(AtomicU64::new(0)),
-            animator: KnightRiderAnimator::with_leds(led_count),
+            animator: KnightRiderAnimator::with_leds(led_count).audio_enabled(audio_enabled),
         }
     }
 
@@ -1590,6 +1635,9 @@ impl ThroughputMeasurer {
         );
         println!(); // Add space for animation
 
+        // Start audio playback for the measurement duration (audio is already configured in constructor)
+        let _audio_handle = self.animator.start_audio();
+
         // Animation state variables
         let mut position = 0; // Current LED position in the display
         let mut direction = 1; // Animation direction: 1 = right, -1 = left
@@ -1605,19 +1653,19 @@ impl ThroughputMeasurer {
                     // Update Knight Rider animation position with bouncing behavior
                     position = if direction > 0 {
                         // Moving right: bounce off right edge
-                        if position >= 49 { // Updated to match LED_COUNT-1
+                        if position >= (LED_BAR_WIDTH - LED_MOVEMENT_SPEED) { // Account for movement speed
                             direction = -1;
-                            48 // One position before the edge
+                            LED_BAR_WIDTH - LED_MOVEMENT_SPEED // One step before the edge
                         } else {
-                            position + 1
+                            position + LED_MOVEMENT_SPEED
                         }
                     } else {
                         // Moving left: bounce off left edge
-                        if position <= 0 {
+                        if position <= LED_MOVEMENT_SPEED - 1 {
                             direction = 1;
-                            1
+                            LED_MOVEMENT_SPEED
                         } else {
-                            position - 1
+                            position - LED_MOVEMENT_SPEED
                         }
                     };
 
@@ -1693,7 +1741,15 @@ async fn main() -> Result<()> {
     // Profiling is now handled automatically by quantum-pulse
 
     // Initialize structured logging for better observability
-    tracing_subscriber::fmt::init();
+    // Filter out noisy audio library logs and default to info level
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::filter::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new("info"))
+                .add_directive("symphonia_core=warn".parse().unwrap())
+                .add_directive("symphonia_bundle_mp3=warn".parse().unwrap()),
+        )
+        .init();
 
     // Parse and validate command-line arguments
     let args = Args::parse();
@@ -1848,7 +1904,7 @@ async fn main() -> Result<()> {
     sleep(Duration::from_secs(3)).await;
 
     // Initialize components
-    let measurer = ThroughputMeasurer::with_leds(50);
+    let measurer = ThroughputMeasurer::with_leds(LED_BAR_WIDTH, !args.silent);
 
     // Reset message counters
     measurer.messages_sent.store(0, Ordering::Relaxed);

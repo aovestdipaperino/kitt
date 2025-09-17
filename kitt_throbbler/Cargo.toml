@@ -12,3 +12,4 @@ readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
+rodio = "0.17"

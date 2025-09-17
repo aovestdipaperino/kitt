@@ -4,9 +4,28 @@
 //! that can be used to display progress, activity, or throughput metrics
 //! in terminal applications.
 
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
+/// Duration between audio playback loops in seconds
+///
+/// This constant defines how often the KITT sound effect will play during animations.
+/// When audio is enabled, the embedded `sfx.mp3` file will play repeatedly at this interval.
+///
+/// # Default Value
+/// The default value of 3.0 seconds provides an authentic KITT experience without being
+/// too intrusive or overwhelming.
+///
+/// # Usage
+/// This constant is used internally by the audio playback system and can be referenced
+/// by users who need to know the audio timing for synchronization purposes.
+pub const AUDIO_LOOP_DURATION_SECS: f32 = 3.0;
 
 /// Animator for creating Knight Rider style LED animations in the terminal
 ///
@@ -18,6 +37,8 @@ pub struct KnightRiderAnimator {
     led_count: usize,
     /// Whether to show throughput rate information with the animation
     show_metrics: bool,
+    /// Whether audio hardware is enabled for sound effects
+    audio_enabled: bool,
 }
 
 /// Animation pattern options for varying the data visualization
@@ -47,6 +68,7 @@ impl KnightRiderAnimator {
         Self {
             led_count: 50,
             show_metrics: true,
+            audio_enabled: false,
         }
     }
 
@@ -67,6 +89,7 @@ impl KnightRiderAnimator {
         Self {
             led_count,
             show_metrics: true,
+            audio_enabled: false,
         }
     }
 
@@ -86,6 +109,108 @@ impl KnightRiderAnimator {
     pub fn show_metrics(mut self, show: bool) -> Self {
         self.show_metrics = show;
         self
+    }
+
+    /// Set whether audio hardware is enabled for sound effects
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - Whether to enable audio playback during animation
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kitt_throbbler::KnightRiderAnimator;
+    ///
+    /// let animator = KnightRiderAnimator::new().audio_enabled(true);
+    /// ```
+    pub fn audio_enabled(mut self, enabled: bool) -> Self {
+        self.audio_enabled = enabled;
+        self
+    }
+
+    /// Starts the audio playback loop in a separate thread
+    fn start_audio_loop(&self) -> Option<(thread::JoinHandle<()>, Arc<AtomicBool>)> {
+        if !self.audio_enabled {
+            return None;
+        }
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_clone = stop_flag.clone();
+
+        let handle = thread::spawn(move || {
+            // Try to initialize audio system
+            let (_stream, stream_handle) = match rodio::OutputStream::try_default() {
+                Ok(output) => output,
+                Err(_) => {
+                    eprintln!("Warning: Could not initialize audio output");
+                    return;
+                }
+            };
+
+            let sink = rodio::Sink::try_new(&stream_handle).unwrap();
+
+            // Embed the MP3 file data at compile time
+            const SFX_DATA: &[u8] = include_bytes!("assets/sfx.mp3");
+
+            loop {
+                if stop_flag_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Create a cursor from the embedded audio data
+                let cursor = Cursor::new(SFX_DATA);
+                if let Ok(source) = rodio::Decoder::new(cursor) {
+                    sink.append(source);
+                }
+
+                // Wait for the configured duration before next play, checking stop flag periodically
+                let wait_iterations = (AUDIO_LOOP_DURATION_SECS * 10.0) as u32;
+                for _ in 0..wait_iterations {
+                    if stop_flag_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+
+            // Wait for any remaining audio to finish
+            sink.sleep_until_end();
+        });
+
+        Some((handle, stop_flag))
+    }
+
+    /// Starts audio playback independently (for use with draw_frame)
+    ///
+    /// Returns a handle to control the audio playback. Audio will play every [`AUDIO_LOOP_DURATION_SECS`] seconds
+    /// until the returned handle is dropped or stop() is called on it.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use kitt_throbbler::KnightRiderAnimator;
+    ///
+    /// let animator = KnightRiderAnimator::new().audio_enabled(true);
+    /// let audio_handle = animator.start_audio();
+    ///
+    /// // Do animation with draw_frame calls...
+    /// // Audio plays automatically every [`AUDIO_LOOP_DURATION_SECS`] seconds
+    ///
+    /// // Stop audio when done
+    /// if let Some(handle) = audio_handle {
+    ///     handle.stop();
+    /// }
+    /// ```
+    pub fn start_audio(&self) -> Option<AudioHandle> {
+        if let Some((handle, stop_flag)) = self.start_audio_loop() {
+            Some(AudioHandle {
+                handle: Some(handle),
+                stop_flag,
+            })
+        } else {
+            None
+        }
     }
 
     /// Draws a single frame of the Knight Rider animation
@@ -176,6 +301,75 @@ impl KnightRiderAnimator {
         io::stdout().flush().unwrap();
     }
 
+    /// Starts an animation loop that continues until stopped
+    ///
+    /// Returns a handle that can be used to control and stop the animation.
+    /// The animation runs in the background and updates the display continuously.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_speed_ms` - Base animation speed in milliseconds (lower is faster)
+    /// * `status_fn` - Function that provides status text for each frame
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use kitt_throbbler::{KnightRiderAnimator, AnimationHandle};
+    /// use std::time::Instant;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let animator = KnightRiderAnimator::new().audio_enabled(true);
+    ///
+    ///     let start_time = Instant::now();
+    ///     let handle = animator.start_animation(50, Box::new(move |_| {
+    ///         format!("Running for {:.1}s", start_time.elapsed().as_secs_f64())
+    ///     })).await;
+    ///
+    ///     // Do other work...
+    ///     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    ///
+    ///     handle.stop().await;
+    /// }
+    /// ```
+    pub async fn start_animation(
+        &self,
+        base_speed_ms: u64,
+        status_fn: Box<dyn Fn(usize) -> String + Send + Sync>,
+    ) -> AnimationHandle {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let audio_control = self.start_audio_loop();
+
+        let animator = self.clone();
+        let stop_flag_clone = stop_flag.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut position = 0;
+            let mut direction = 1;
+
+            while !stop_flag_clone.load(Ordering::Relaxed) {
+                let status = status_fn(position);
+                animator.draw_frame(position, direction, &status);
+
+                // Move position and handle direction changes
+                position = (position as i32 + direction) as usize;
+                if position >= animator.led_count - 1 {
+                    direction = -1;
+                } else if position == 0 {
+                    direction = 1;
+                }
+
+                sleep(Duration::from_millis(base_speed_ms)).await;
+            }
+        });
+
+        AnimationHandle {
+            task_handle: Some(handle),
+            stop_flag,
+            audio_control,
+        }
+    }
+
     /// Run a demo animation for a specified duration
     ///
     /// # Arguments
@@ -198,10 +392,20 @@ impl KnightRiderAnimator {
     pub async fn run_demo(&self, duration_secs: u64, base_speed_ms: u64, max_rate_value: f64) {
         println!("Running Knight Rider animation demo...");
         println!(
-            "Duration: {}s, Base speed: {}ms, Max rate: {}",
-            duration_secs, base_speed_ms, max_rate_value
+            "Duration: {}s, Base speed: {}ms, Max rate: {}, Audio: {}",
+            duration_secs,
+            base_speed_ms,
+            max_rate_value,
+            if self.audio_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
         println!("Press Ctrl+C to exit");
+
+        // Start audio loop if enabled
+        let audio_control = self.start_audio_loop();
 
         let duration = Duration::from_secs(duration_secs);
         let start = Instant::now();
@@ -298,7 +502,98 @@ impl KnightRiderAnimator {
             sleep(Duration::from_millis(delay_ms)).await;
         }
 
+        // Stop audio playback
+        if let Some((handle, stop_flag)) = audio_control {
+            stop_flag.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+
         println!("\nAnimation demo completed!");
+    }
+}
+
+/// Handle for controlling a running animation
+///
+/// This handle allows you to stop an animation that was started with
+/// `start_animation()`. When dropped, it will automatically stop the animation.
+pub struct AnimationHandle {
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+    stop_flag: Arc<AtomicBool>,
+    audio_control: Option<(thread::JoinHandle<()>, Arc<AtomicBool>)>,
+}
+
+impl AnimationHandle {
+    /// Stops the animation and audio playback
+    ///
+    /// This method will gracefully stop the animation loop and any associated
+    /// audio playback, then wait for all threads to complete.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use kitt_throbbler::KnightRiderAnimator;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let animator = KnightRiderAnimator::new();
+    ///     let handle = animator.start_animation(50, Box::new(|_| "Running...".to_string())).await;
+    ///
+    ///     // Later...
+    ///     handle.stop().await;
+    /// }
+    /// ```
+    pub async fn stop(mut self) {
+        // Signal the animation to stop
+        self.stop_flag.store(true, Ordering::Relaxed);
+
+        // Wait for the animation task to complete
+        if let Some(handle) = self.task_handle.take() {
+            let _ = handle.await;
+        }
+
+        // Stop audio playback
+        if let Some((audio_handle, audio_stop_flag)) = self.audio_control.take() {
+            audio_stop_flag.store(true, Ordering::Relaxed);
+            let _ = audio_handle.join();
+        }
+
+        // Clear the animation line
+        print!("\r");
+        io::stdout().flush().unwrap();
+    }
+}
+
+impl Drop for AnimationHandle {
+    fn drop(&mut self) {
+        // Signal stop if not already stopped
+        self.stop_flag.store(true, Ordering::Relaxed);
+
+        // Stop audio if present
+        if let Some((_, audio_stop_flag)) = &self.audio_control {
+            audio_stop_flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Handle for controlling audio playback independently
+pub struct AudioHandle {
+    handle: Option<thread::JoinHandle<()>>,
+    stop_flag: Arc<AtomicBool>,
+}
+
+impl AudioHandle {
+    /// Stops the audio playback
+    pub fn stop(mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for AudioHandle {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
     }
 }
 
@@ -317,11 +612,15 @@ mod tests {
         let animator = KnightRiderAnimator::new();
         assert_eq!(animator.led_count, 50);
         assert_eq!(animator.show_metrics, true);
+        assert_eq!(animator.audio_enabled, false);
 
         let custom_animator = KnightRiderAnimator::with_leds(30);
         assert_eq!(custom_animator.led_count, 30);
 
         let no_metrics = KnightRiderAnimator::new().show_metrics(false);
         assert_eq!(no_metrics.show_metrics, false);
+
+        let audio_enabled = KnightRiderAnimator::new().audio_enabled(true);
+        assert_eq!(audio_enabled.audio_enabled, true);
     }
 }
