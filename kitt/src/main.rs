@@ -171,6 +171,11 @@ struct Args {
     /// Disable audio playback during animation
     #[arg(long, default_value = "false")]
     silent: bool,
+
+    /// Generate random keys for messages. If a value is provided, creates a pool of that size
+    /// to pick keys from. If no value is provided, generates unique random keys on the fly.
+    #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+    random_keys: Option<usize>,
 }
 
 /// Represents the size configuration for test messages
@@ -219,6 +224,57 @@ impl MessageSize {
     }
 }
 
+/// Strategy for generating message keys
+///
+/// Kafka message keys determine partition assignment and enable log compaction.
+/// This enum allows testing different key generation strategies.
+#[derive(Debug, Clone)]
+enum KeyStrategy {
+    /// No keys - messages have null keys (default Kafka behavior)
+    NoKeys,
+    /// Generate unique random keys on the fly for each message
+    RandomOnTheFly,
+    /// Pick keys randomly from a pre-generated pool of the specified size
+    RandomPool(Arc<Vec<Bytes>>),
+}
+
+impl KeyStrategy {
+    /// Creates a KeyStrategy from the command-line argument value
+    ///
+    /// # Arguments
+    /// * `pool_size` - None for no keys, Some(0) for on-the-fly generation,
+    ///   Some(n) for a pool of n pre-generated keys
+    fn from_arg(pool_size: Option<usize>) -> Self {
+        match pool_size {
+            None => KeyStrategy::NoKeys,
+            Some(0) => KeyStrategy::RandomOnTheFly,
+            Some(size) => {
+                // Pre-generate a pool of random keys
+                let keys: Vec<Bytes> = (0..size)
+                    .map(|_| Bytes::from(uuid::Uuid::new_v4().to_string()))
+                    .collect();
+                KeyStrategy::RandomPool(Arc::new(keys))
+            }
+        }
+    }
+
+    /// Generates a key based on the configured strategy
+    ///
+    /// # Returns
+    /// * `None` - For NoKeys strategy
+    /// * `Some(Bytes)` - A random key for other strategies
+    fn generate_key(&self) -> Option<Bytes> {
+        match self {
+            KeyStrategy::NoKeys => None,
+            KeyStrategy::RandomOnTheFly => Some(Bytes::from(uuid::Uuid::new_v4().to_string())),
+            KeyStrategy::RandomPool(pool) => {
+                let key = pool.choose(&mut thread_rng()).expect("pool should not be empty");
+                Some(key.clone())
+            }
+        }
+    }
+}
+
 /// Kafka message producer that sends messages to a specific topic
 /// Each producer instance runs in its own thread and targets specific partitions
 #[derive(Clone)]
@@ -237,6 +293,8 @@ struct Producer {
     thread_id: usize,
     /// Whether to use sticky partition assignment (true) or random (false)
     use_sticky_partitions: bool,
+    /// Strategy for generating message keys
+    key_strategy: KeyStrategy,
 }
 
 impl Producer {
@@ -250,6 +308,8 @@ impl Producer {
     /// * `message_size` - Size configuration for generated messages
     /// * `thread_id` - Unique identifier for this producer thread
     /// * `use_sticky_partitions` - Whether to use sticky partition assignment
+    /// * `key_strategy` - Strategy for generating message keys
+    #[expect(clippy::too_many_arguments, reason = "Producer configuration requires multiple parameters")]
     fn new(
         client: Arc<KafkaClient>,
         topic: String,
@@ -258,6 +318,7 @@ impl Producer {
         message_size: MessageSize,
         thread_id: usize,
         use_sticky_partitions: bool,
+        key_strategy: KeyStrategy,
     ) -> Self {
         Self {
             client,
@@ -267,6 +328,7 @@ impl Producer {
             message_size,
             thread_id,
             use_sticky_partitions,
+            key_strategy,
         }
     }
 
@@ -388,6 +450,9 @@ impl Producer {
                 let payload = vec![b'x'; size];
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
+                // Generate message key based on configured strategy
+                let key = self.key_strategy.generate_key();
+
                 // Create a Kafka record
                 // NOTE: offset is always 0 in PRODUCE requests - the broker assigns actual offsets
                 // The broker-assigned offset will be returned in the ProduceResponse.base_offset
@@ -401,7 +466,7 @@ impl Producer {
                     offset: 0,    // Always 0 for producers - broker assigns actual offset
                     sequence: -1, // Disable sequence tracking for non-idempotent producer
                     timestamp,
-                    key: None,
+                    key,
                     value: Some(Bytes::from(payload)),
                     headers: indexmap::IndexMap::new(),
                 };
@@ -1794,6 +1859,16 @@ async fn main() -> Result<()> {
         MessageSize::parse(&args.message_size)?
     });
 
+    // Create key strategy from command-line argument
+    let key_strategy = KeyStrategy::from_arg(args.random_keys);
+    if let Some(pool_size) = args.random_keys {
+        if pool_size == 0 {
+            info!("Using random keys: generating unique keys on the fly");
+        } else {
+            info!("Using random keys: pool of {} pre-generated keys", pool_size);
+        }
+    }
+
     // Calculate partitions and threads based on mode
     let (num_producer_threads, num_consumer_threads, total_partitions) = if args.sticky {
         // Legacy sticky mode: use LCM-based calculation
@@ -1952,6 +2027,7 @@ async fn main() -> Result<()> {
             message_size.clone(),
             i,
             args.sticky,
+            key_strategy.clone(),
         ));
     }
 
