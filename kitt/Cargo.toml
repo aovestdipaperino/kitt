@@ -1,6 +1,6 @@
 [package]
 name = "kitt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Kafka throughput measurement tool"
 license = "MIT"
@@ -27,6 +27,7 @@ anyhow = "1.0.80"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 bytes = "1.10.1"
+crc32c = "0.6"
 serde = { version = "1.0.179", features = ["derive"] }
 chrono = "0.4.38"
 futures = "0.3"

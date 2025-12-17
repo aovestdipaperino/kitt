@@ -97,6 +97,62 @@ fn lcm(a: usize, b: usize) -> usize {
     a * b / gcd(a, b)
 }
 
+/// Verify CRC32-C of a Kafka record batch
+///
+/// Kafka record batch format (v2):
+/// - baseOffset: int64 (8 bytes) - offset 0
+/// - batchLength: int32 (4 bytes) - offset 8
+/// - partitionLeaderEpoch: int32 (4 bytes) - offset 12
+/// - magic: int8 (1 byte) - offset 16
+/// - crc: int32 (4 bytes) - offset 17
+/// - attributes onwards: covered by CRC - offset 21
+///
+/// Returns Ok(batch_length) if CRC matches, Err with details if not
+fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
+    // Minimum size for a record batch header
+    if data.len() < 21 {
+        return Err(anyhow!("Record batch too short: {} bytes", data.len()));
+    }
+
+    // Read batch length (offset 8, 4 bytes, big-endian)
+    let batch_length = i32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+
+    // Total batch size = 8 (baseOffset) + 4 (batchLength) + batchLength
+    let total_batch_size = 12 + batch_length;
+    if data.len() < total_batch_size {
+        return Err(anyhow!(
+            "Incomplete record batch: expected {} bytes, got {}",
+            total_batch_size,
+            data.len()
+        ));
+    }
+
+    // Read magic byte (offset 16)
+    let magic = data[16];
+    if magic != 2 {
+        // Only verify CRC for magic version 2 (modern format)
+        debug!("Skipping CRC check for magic version {}", magic);
+        return Ok(total_batch_size);
+    }
+
+    // Read stored CRC (offset 17, 4 bytes, big-endian)
+    let stored_crc = u32::from_be_bytes([data[17], data[18], data[19], data[20]]);
+
+    // Compute CRC32-C over data from attributes (offset 21) to end of batch
+    let crc_data = &data[21..total_batch_size];
+    let computed_crc = crc32c::crc32c(crc_data);
+
+    if stored_crc != computed_crc {
+        return Err(anyhow!(
+            "CRC mismatch: stored=0x{:08x}, computed=0x{:08x}",
+            stored_crc,
+            computed_crc
+        ));
+    }
+
+    Ok(total_batch_size)
+}
+
 mod kafka_client;
 pub mod profiling;
 use kafka_client::KafkaClient;
@@ -176,6 +232,10 @@ struct Args {
     /// to pick keys from. If no value is provided, generates unique random keys on the fly.
     #[arg(long, num_args = 0..=1, default_missing_value = "0")]
     random_keys: Option<usize>,
+
+    /// Number of messages to include in each record batch (default: 1)
+    #[arg(long, default_value = "1")]
+    messages_per_batch: usize,
 }
 
 /// Represents the size configuration for test messages
@@ -295,6 +355,8 @@ struct Producer {
     use_sticky_partitions: bool,
     /// Strategy for generating message keys
     key_strategy: KeyStrategy,
+    /// Number of messages to include in each record batch
+    messages_per_batch: usize,
 }
 
 impl Producer {
@@ -309,6 +371,7 @@ impl Producer {
     /// * `thread_id` - Unique identifier for this producer thread
     /// * `use_sticky_partitions` - Whether to use sticky partition assignment
     /// * `key_strategy` - Strategy for generating message keys
+    /// * `messages_per_batch` - Number of messages to include in each record batch
     #[expect(clippy::too_many_arguments, reason = "Producer configuration requires multiple parameters")]
     fn new(
         client: Arc<KafkaClient>,
@@ -319,6 +382,7 @@ impl Producer {
         thread_id: usize,
         use_sticky_partitions: bool,
         key_strategy: KeyStrategy,
+        messages_per_batch: usize,
     ) -> Self {
         Self {
             client,
@@ -329,6 +393,7 @@ impl Producer {
             thread_id,
             use_sticky_partitions,
             key_strategy,
+            messages_per_batch,
         }
     }
 
@@ -443,37 +508,46 @@ impl Producer {
                     self.total_partitions
                 );
 
-                // Generate message with configured size
-                let size = profile!(KittOperation::MessageSizeGeneration, {
-                    self.message_size.generate_size()
-                });
-                let payload = vec![b'x'; size];
-                let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+                // Create multiple records for this partition's batch
+                let mut records = Vec::with_capacity(self.messages_per_batch);
+                for _ in 0..self.messages_per_batch {
+                    // Generate message with configured size
+                    let size = profile!(KittOperation::MessageSizeGeneration, {
+                        self.message_size.generate_size()
+                    });
+                    let payload = vec![b'x'; size];
+                    let timestamp =
+                        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
-                // Generate message key based on configured strategy
-                let key = self.key_strategy.generate_key();
+                    // Generate message key based on configured strategy (different key for each message)
+                    let key = self.key_strategy.generate_key();
 
-                // Create a Kafka record
-                // NOTE: offset is always 0 in PRODUCE requests - the broker assigns actual offsets
-                // The broker-assigned offset will be returned in the ProduceResponse.base_offset
-                let record = Record {
-                    transactional: false,
-                    control: false,
-                    partition_leader_epoch: 0,
-                    producer_id: -1, // Disable idempotent producer (-1 means not using idempotence)
-                    producer_epoch: -1, // Disable idempotent producer
-                    timestamp_type: TimestampType::Creation,
-                    offset: 0,    // Always 0 for producers - broker assigns actual offset
-                    sequence: -1, // Disable sequence tracking for non-idempotent producer
-                    timestamp,
-                    key,
-                    value: Some(Bytes::from(payload)),
-                    headers: indexmap::IndexMap::new(),
-                };
+                    // Create a Kafka record
+                    // NOTE: offset is always 0 in PRODUCE requests - the broker assigns actual offsets
+                    // The broker-assigned offset will be returned in the ProduceResponse.base_offset
+                    records.push(Record {
+                        transactional: false,
+                        control: false,
+                        partition_leader_epoch: 0,
+                        producer_id: -1, // Disable idempotent producer (-1 means not using idempotence)
+                        producer_epoch: -1, // Disable idempotent producer
+                        timestamp_type: TimestampType::Creation,
+                        offset: 0,    // Always 0 for producers - broker assigns actual offset
+                        sequence: -1, // Disable sequence tracking for non-idempotent producer
+                        timestamp,
+                        key,
+                        value: Some(Bytes::from(payload)),
+                        headers: indexmap::IndexMap::new(),
+                    });
+                }
 
-                // Encode the record into a batch
+                // Encode all records into a single batch
                 let mut batch_buf = bytes::BytesMut::new();
-                RecordBatchEncoder::encode(&mut batch_buf, [&record], &options)?;
+                RecordBatchEncoder::encode(
+                    &mut batch_buf,
+                    records.iter().collect::<Vec<_>>(),
+                    &options,
+                )?;
                 let batch = batch_buf.freeze();
 
                 // Create partition data
@@ -485,8 +559,9 @@ impl Producer {
 
             request.topic_data.push(topic_data);
 
-            // Track messages before sending (1 per partition)
-            messages_sent.fetch_add(partition_count as u64, Ordering::Relaxed);
+            // Track messages before sending (messages_per_batch per partition)
+            let total_messages_in_request = partition_count as u64 * self.messages_per_batch as u64;
+            messages_sent.fetch_add(total_messages_in_request, Ordering::Relaxed);
 
             // Send the batched request asynchronously
             let version = self.client.get_supported_version(ApiKey::Produce, 3);
@@ -1112,6 +1187,18 @@ impl Consumer {
                                                         while records_cursor.position()
                                                             < records.len() as u64
                                                         {
+                                                            // Verify CRC before decoding
+                                                            let remaining_data = &records.as_ref()
+                                                                [records_cursor.position() as usize..];
+                                                            if let Err(crc_err) =
+                                                                verify_record_batch_crc(remaining_data)
+                                                            {
+                                                                panic!(
+                                                                    "CRC verification failed for partition {}: {}",
+                                                                    partition_id, crc_err
+                                                                );
+                                                            }
+
                                                             match RecordBatchDecoder::decode(
                                                                 &mut records_cursor,
                                                             ) {
@@ -2028,6 +2115,7 @@ async fn main() -> Result<()> {
             i,
             args.sticky,
             key_strategy.clone(),
+            args.messages_per_batch,
         ));
     }
 

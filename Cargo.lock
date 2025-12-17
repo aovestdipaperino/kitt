@@ -744,6 +744,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc32c",
  "futures",
  "indexmap",
  "kafka-protocol",
