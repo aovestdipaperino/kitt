@@ -236,6 +236,10 @@ struct Args {
     /// Number of messages to include in each record batch (default: 1)
     #[arg(long, default_value = "1")]
     messages_per_batch: usize,
+
+    /// Simulated processing time per record in milliseconds (default: 0 = no delay)
+    #[arg(long, default_value = "0")]
+    record_processing_time: u64,
 }
 
 /// Represents the size configuration for test messages
@@ -966,6 +970,8 @@ struct Consumer {
     thread_id: usize,
     /// Initial delay in seconds before starting to fetch messages
     fetch_delay: u64,
+    /// Simulated processing time per record in milliseconds
+    record_processing_time: u64,
 }
 
 impl Consumer {
@@ -976,13 +982,15 @@ impl Consumer {
     /// * `topic` - Source topic name for message consumption
     /// * `consumer_partitions_per_thread` - Number of partitions assigned to this thread
     /// * `thread_id` - Unique identifier for this consumer thread
-    /// * `thread_id` - Unique identifier for this consumer thread
+    /// * `fetch_delay` - Initial delay in seconds before starting to fetch messages
+    /// * `record_processing_time` - Simulated processing time per record in milliseconds
     fn new(
         client: Arc<KafkaClient>,
         topic: String,
         consumer_partitions_per_thread: i32,
         thread_id: usize,
         fetch_delay: u64,
+        record_processing_time: u64,
     ) -> Self {
         Self {
             client,
@@ -990,6 +998,7 @@ impl Consumer {
             consumer_partitions_per_thread,
             thread_id,
             fetch_delay,
+            record_processing_time,
         }
     }
 
@@ -1203,12 +1212,27 @@ impl Consumer {
                                                                 &mut records_cursor,
                                                             ) {
                                                                 Ok(record_set) => {
+                                                                    let record_count =
+                                                                        record_set.records.len();
                                                                     partition_message_count +=
-                                                                        record_set.records.len()
-                                                                            as u64;
+                                                                        record_count as u64;
+
+                                                                    // Simulate processing time per record
+                                                                    if self.record_processing_time > 0
+                                                                    {
+                                                                        tokio::time::sleep(
+                                                                            Duration::from_millis(
+                                                                                self.record_processing_time
+                                                                                    * record_count
+                                                                                        as u64,
+                                                                            ),
+                                                                        )
+                                                                        .await;
+                                                                    }
+
                                                                     debug!(
                                                                         "Decoded record batch with {} records",
-                                                                        record_set.records.len()
+                                                                        record_count
                                                                     );
                                                                 }
                                                                 Err(e) => {
@@ -2126,12 +2150,21 @@ async fn main() -> Result<()> {
             args.consumer_partitions_per_thread,
             i,
             args.fetch_delay,
+            args.record_processing_time,
         ));
     }
     info!("All client connections established successfully");
 
     // Calculate adjusted max backlog to compensate for fetch delay
-    let max_backlog = if args.fetch_delay > 0 {
+    // When record_processing_time is set, disable backpressure to measure max producer throughput
+    let max_backlog = if args.record_processing_time > 0 {
+        info!(
+            "🔧 Slow consumer simulation enabled: {}ms per record",
+            args.record_processing_time
+        );
+        info!("📊 Backpressure disabled to measure maximum producer throughput");
+        u64::MAX
+    } else if args.fetch_delay > 0 {
         let adjusted_backlog = BASE_MAX_BACKLOG * args.fetch_delay;
         info!(
             "🔧 Fetch delay compensation enabled: {}s delay",
