@@ -131,10 +131,10 @@ impl KafkaClient {
 
     /// Attempts to establish TCP connection with retry mechanism
     ///
-    /// Retries connection every 1 second for up to 10 seconds total
+    /// Retries connection with exponential backoff (1s, 2s, 4s, 8s, 16s, 32s) for up to 7 attempts
     async fn connect_with_retry(broker: &str) -> Result<TcpStream> {
-        let max_attempts = 10;
-        let retry_interval = Duration::from_secs(1);
+        let max_attempts = 7;
+        let base_delay_ms = 1000u64;
 
         for attempt in 1..=max_attempts {
             match TcpStream::connect(broker).await {
@@ -157,11 +157,13 @@ impl KafkaClient {
                         ));
                     }
 
+                    // Exponential backoff: 1s, 2s, 4s, 8s
+                    let delay_ms = base_delay_ms * (1 << (attempt - 1));
                     warn!(
-                        "Connection attempt {} failed, retrying in 1 second: {}",
-                        attempt, e
+                        "Connection attempt {} failed, retrying in {}ms: {}",
+                        attempt, delay_ms, e
                     );
-                    sleep(retry_interval).await;
+                    sleep(Duration::from_millis(delay_ms)).await;
                 }
             }
         }
