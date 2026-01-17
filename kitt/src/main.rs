@@ -240,6 +240,11 @@ struct Args {
     /// Simulated processing time per record in milliseconds (default: 0 = no delay)
     #[arg(long, default_value = "0")]
     record_processing_time: u64,
+
+    /// Produce-only mode: skip consumers and backpressure to measure pure producer throughput.
+    /// Optionally specify a data target (e.g., "1GB", "500MB") to run until that amount is sent.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    produce_only: Option<String>,
 }
 
 /// Represents the size configuration for test messages
@@ -286,6 +291,55 @@ impl MessageSize {
             MessageSize::Range(min, max) => thread_rng().gen_range(*min..=*max),
         }
     }
+
+}
+
+/// Formats a byte count into a human-readable string (KB, MB, GB, etc.)
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Parses a human-readable byte size string (e.g., "1GB", "500MB", "1024KB") into bytes
+fn parse_bytes(s: &str) -> Result<u64> {
+    let s = s.trim().to_uppercase();
+
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+
+    // Find where the numeric part ends
+    let numeric_end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+
+    let (num_str, unit) = s.split_at(numeric_end);
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| anyhow!("Invalid number in size: {}", s))?;
+
+    let multiplier = match unit.trim() {
+        "" | "B" => 1,
+        "K" | "KB" | "KIB" => KB,
+        "M" | "MB" | "MIB" => MB,
+        "G" | "GB" | "GIB" => GB,
+        "T" | "TB" | "TIB" => TB,
+        _ => return Err(anyhow!("Unknown unit in size: {}", unit)),
+    };
+
+    Ok((num * multiplier as f64) as u64)
 }
 
 /// Strategy for generating message keys
@@ -420,9 +474,11 @@ impl Producer {
         &self,
         duration: Duration,
         messages_sent: Arc<AtomicU64>,
+        bytes_sent: Arc<AtomicU64>,
         messages_received: Arc<AtomicU64>,
         max_backlog: u64,
         message_validation: bool,
+        bytes_target: Option<u64>,
     ) -> Result<()> {
         let end_time = Instant::now() + duration;
 
@@ -440,6 +496,13 @@ impl Producer {
         let mut pending_futures = Vec::new();
 
         while Instant::now() < end_time {
+            // Check if we've reached the bytes target (if specified)
+            if let Some(target) = bytes_target {
+                if bytes_sent.load(Ordering::Relaxed) >= target {
+                    break;
+                }
+            }
+
             // Implement backpressure control to prevent memory exhaustion
             let sent = messages_sent.load(Ordering::Relaxed);
             let received = messages_received.load(Ordering::Relaxed);
@@ -470,6 +533,9 @@ impl Producer {
                 version: 2,
                 compression: Compression::None,
             };
+
+            // Track total bytes for this request
+            let mut total_bytes_in_request: u64 = 0;
 
             // Create one message for each partition based on assignment strategy
             for i in 0..partition_count {
@@ -519,6 +585,7 @@ impl Producer {
                     let size = profile!(KittOperation::MessageSizeGeneration, {
                         self.message_size.generate_size()
                     });
+                    total_bytes_in_request += size as u64;
                     let payload = vec![b'x'; size];
                     let timestamp =
                         SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
@@ -563,9 +630,10 @@ impl Producer {
 
             request.topic_data.push(topic_data);
 
-            // Track messages before sending (messages_per_batch per partition)
+            // Track messages and bytes before sending (messages_per_batch per partition)
             let total_messages_in_request = partition_count as u64 * self.messages_per_batch as u64;
             messages_sent.fetch_add(total_messages_in_request, Ordering::Relaxed);
+            bytes_sent.fetch_add(total_bytes_in_request, Ordering::Relaxed);
 
             // Send the batched request asynchronously
             let version = self.client.get_supported_version(ApiKey::Produce, 3);
@@ -1741,6 +1809,8 @@ fn test_fetch_response_validation() {
 struct ThroughputMeasurer {
     /// Atomic counter for total messages sent by all producer threads
     messages_sent: Arc<AtomicU64>,
+    /// Atomic counter for total bytes sent by all producer threads
+    bytes_sent: Arc<AtomicU64>,
     /// Atomic counter for total messages received by all consumer threads
     messages_received: Arc<AtomicU64>,
     /// Sum of all backlog percentage measurements for calculating average
@@ -1756,6 +1826,7 @@ impl ThroughputMeasurer {
     fn with_leds(led_count: usize, audio_enabled: bool) -> Self {
         Self {
             messages_sent: Arc::new(AtomicU64::new(0)),
+            bytes_sent: Arc::new(AtomicU64::new(0)),
             messages_received: Arc::new(AtomicU64::new(0)),
             backlog_percentage_sum: Arc::new(AtomicU64::new(0)),
             backlog_measurement_count: Arc::new(AtomicU64::new(0)),
@@ -1776,14 +1847,16 @@ impl ThroughputMeasurer {
     /// * `fetch_delay` - Initial delay before starting measurement
     ///
     /// # Returns
-    /// * `(min_rate, max_rate)` - Tuple containing minimum and maximum measured rates
+    /// * `(min_rate, max_rate, elapsed)` - Tuple containing minimum/maximum rates and actual elapsed time
     async fn measure(
         &self,
         duration: Duration,
         label: &str,
         max_backlog: u64,
         fetch_delay: u64,
-    ) -> (f64, f64) {
+        produce_only: bool,
+        bytes_target: Option<u64>,
+    ) -> (f64, f64, Duration) {
         // Wait for fetch delay before starting measurement
         if fetch_delay > 0 {
             info!(
@@ -1800,15 +1873,28 @@ impl ThroughputMeasurer {
         let mut rate_interval = interval(Duration::from_millis(500));
 
         // Baseline counters for rate calculation
-        let start_received = self.messages_received.load(Ordering::Relaxed);
-        let mut last_received = start_received;
+        // In produce-only mode, track sent messages; otherwise track received
+        let start_count = if produce_only {
+            self.messages_sent.load(Ordering::Relaxed)
+        } else {
+            self.messages_received.load(Ordering::Relaxed)
+        };
+        let mut last_count = start_count;
         let mut last_rate_time = start_time;
 
-        info!(
-            "🚀 Starting {} phase for {} seconds (after delay)",
-            label,
-            duration.as_secs()
-        );
+        if let Some(target) = bytes_target {
+            info!(
+                "🚀 Starting {} phase until {} sent",
+                label,
+                format_bytes(target)
+            );
+        } else {
+            info!(
+                "🚀 Starting {} phase for {} seconds (after delay)",
+                label,
+                duration.as_secs()
+            );
+        }
         println!(); // Add space for animation
 
         // Start audio playback for the measurement duration (audio is already configured in constructor)
@@ -1824,6 +1910,13 @@ impl ThroughputMeasurer {
 
         // Main measurement loop with concurrent animation and rate calculation
         while Instant::now() < end_time {
+            // Check if bytes target reached (if specified)
+            if let Some(target) = bytes_target {
+                if self.bytes_sent.load(Ordering::Relaxed) >= target {
+                    break;
+                }
+            }
+
             select! {
                 _ = animation_interval.tick() => {
                     // Update Knight Rider animation position with bouncing behavior
@@ -1872,12 +1965,16 @@ impl ThroughputMeasurer {
                 _ = rate_interval.tick() => {
                     // Calculate instantaneous throughput rate
                     let now = Instant::now();
-                    let current_received = self.messages_received.load(Ordering::Relaxed);
+                    let current_count = if produce_only {
+                        self.messages_sent.load(Ordering::Relaxed)
+                    } else {
+                        self.messages_received.load(Ordering::Relaxed)
+                    };
                     let time_elapsed = now.duration_since(last_rate_time).as_secs_f64();
 
                     if time_elapsed > 0.0 {
                         // Calculate messages per second since last measurement
-                        current_rate = (current_received - last_received) as f64 / time_elapsed;
+                        current_rate = (current_count - last_count) as f64 / time_elapsed;
 
                         // Track performance statistics (ignore initial zero rates)
                         if current_rate > 0.0 {
@@ -1890,7 +1987,7 @@ impl ThroughputMeasurer {
                         }
 
                         // Update baseline for next calculation
-                        last_received = current_received;
+                        last_count = current_count;
                         last_rate_time = now;
                     }
                 }
@@ -1898,7 +1995,8 @@ impl ThroughputMeasurer {
         }
 
         println!(); // New line after animation completes
-        (min_rate, max_rate)
+        let elapsed = start_time.elapsed();
+        (min_rate, max_rate, elapsed)
     }
 }
 
@@ -2094,16 +2192,24 @@ async fn main() -> Result<()> {
 
     // Reset message counters
     measurer.messages_sent.store(0, Ordering::Relaxed);
+    measurer.bytes_sent.store(0, Ordering::Relaxed);
     measurer.messages_received.store(0, Ordering::Relaxed);
 
     // Create multiple producer and consumer clients
     let mut producer_clients = Vec::new();
     let mut consumer_clients = Vec::new();
 
-    info!(
-        "Creating {} producer and {} consumer connections...",
-        num_producer_threads, num_consumer_threads
-    );
+    if args.produce_only.is_some() {
+        info!(
+            "Creating {} producer connections (produce-only mode)...",
+            num_producer_threads
+        );
+    } else {
+        info!(
+            "Creating {} producer and {} consumer connections...",
+            num_producer_threads, num_consumer_threads
+        );
+    }
 
     // Create producer clients
     for i in 0..num_producer_threads {
@@ -2115,14 +2221,16 @@ async fn main() -> Result<()> {
         producer_clients.push(producer_client);
     }
 
-    // Create consumer clients
-    for i in 0..num_consumer_threads {
-        let consumer_client = Arc::new(
-            KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
-                .await
-                .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
-        );
-        consumer_clients.push(consumer_client);
+    // Create consumer clients (skip in produce-only mode)
+    if args.produce_only.is_none() {
+        for i in 0..num_consumer_threads {
+            let consumer_client = Arc::new(
+                KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
+            );
+            consumer_clients.push(consumer_client);
+        }
     }
 
     // Create producers and consumers for each thread
@@ -2143,21 +2251,45 @@ async fn main() -> Result<()> {
         ));
     }
 
-    for i in 0..num_consumer_threads {
-        consumers.push(Consumer::new(
-            consumer_clients[i].clone(),
-            topic_name.clone(),
-            args.consumer_partitions_per_thread,
-            i,
-            args.fetch_delay,
-            args.record_processing_time,
-        ));
+    if args.produce_only.is_none() {
+        for i in 0..num_consumer_threads {
+            consumers.push(Consumer::new(
+                consumer_clients[i].clone(),
+                topic_name.clone(),
+                args.consumer_partitions_per_thread,
+                i,
+                args.fetch_delay,
+                args.record_processing_time,
+            ));
+        }
     }
     info!("All client connections established successfully");
 
+    // Parse produce-only data target if specified
+    let produce_only_target: Option<u64> = if let Some(ref target_str) = args.produce_only {
+        if target_str.is_empty() {
+            None // --produce-only without value: time-based
+        } else {
+            Some(parse_bytes(target_str)?) // --produce-only 1GB: data-target based
+        }
+    } else {
+        None
+    };
+
     // Calculate adjusted max backlog to compensate for fetch delay
-    // When record_processing_time is set, disable backpressure to measure max producer throughput
-    let max_backlog = if args.record_processing_time > 0 {
+    // When produce_only or record_processing_time is set, disable backpressure to measure max producer throughput
+    let max_backlog = if args.produce_only.is_some() {
+        if let Some(target) = produce_only_target {
+            info!(
+                "🚀 Produce-only mode: will send {} then stop",
+                format_bytes(target)
+            );
+        } else {
+            info!("🚀 Produce-only mode: consumers disabled, measuring pure producer throughput");
+        }
+        info!("📊 Backpressure disabled");
+        u64::MAX
+    } else if args.record_processing_time > 0 {
         info!(
             "🔧 Slow consumer simulation enabled: {}ms per record",
             args.record_processing_time
@@ -2208,6 +2340,7 @@ async fn main() -> Result<()> {
 
     // Reset counters before measurement
     measurer.messages_sent.store(0, Ordering::Relaxed);
+    measurer.bytes_sent.store(0, Ordering::Relaxed);
     measurer.messages_received.store(0, Ordering::Relaxed);
 
     // Start multiple producer and consumer threads
@@ -2217,61 +2350,80 @@ async fn main() -> Result<()> {
     for i in 0..num_producer_threads {
         let producer = producers[i].clone();
         let messages_sent = measurer.messages_sent.clone();
+        let bytes_sent = measurer.bytes_sent.clone();
         let messages_received = measurer.messages_received.clone();
         let message_validation = args.message_validation;
+        let bytes_target = produce_only_target;
         let producer_handle = tokio::spawn(async move {
             producer
                 .produce_messages(
                     total_test_duration,
                     messages_sent,
+                    bytes_sent,
                     messages_received,
                     max_backlog,
                     message_validation,
+                    bytes_target,
                 )
                 .await
         });
         producer_handles.push(producer_handle);
     }
 
-    for i in 0..num_consumer_threads {
-        let consumer = consumers[i].clone();
-        let messages_received = measurer.messages_received.clone();
-        let message_validation = args.message_validation;
-        let consumer_handle = tokio::spawn(async move {
-            consumer
-                .consume_messages(total_test_duration, messages_received, message_validation)
-                .await
-        });
-        consumer_handles.push(consumer_handle);
+    if args.produce_only.is_none() {
+        for i in 0..num_consumer_threads {
+            let consumer = consumers[i].clone();
+            let messages_received = measurer.messages_received.clone();
+            let message_validation = args.message_validation;
+            let consumer_handle = tokio::spawn(async move {
+                consumer
+                    .consume_messages(total_test_duration, messages_received, message_validation)
+                    .await
+            });
+            consumer_handles.push(consumer_handle);
+        }
     }
 
     let measurement_handle = tokio::spawn({
         let measurer = measurer.clone();
+        let produce_only = args.produce_only.is_some();
+        let bytes_target = produce_only_target;
         async move {
-            let (min_rate, max_rate) = measurer
+            let (min_rate, max_rate, elapsed) = measurer
                 .measure(
                     measurement_duration,
                     "MEASUREMENT",
                     max_backlog,
                     args.fetch_delay,
+                    produce_only,
+                    bytes_target,
                 )
                 .await;
 
             let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
             let final_received = measurer.messages_received.load(Ordering::Relaxed);
-            let throughput = final_received as f64 / measurement_duration.as_secs_f64();
-            let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
-            let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
-            let avg_backlog = if backlog_count > 0 {
-                backlog_sum / backlog_count
-            } else {
-                0
-            };
+            let total_data_sent = measurer.bytes_sent.load(Ordering::Relaxed);
 
             info!("=== FINAL RESULTS ===");
-            info!("Messages sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, avg backlog: {}%)", final_sent, final_received, throughput,
-                min_rate, max_rate, avg_backlog
-            );
+            if produce_only {
+                let throughput = final_sent as f64 / elapsed.as_secs_f64();
+                info!(
+                    "Messages sent: {}, Data sent: {}, Producer throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s)",
+                    final_sent, format_bytes(total_data_sent), throughput, min_rate, max_rate
+                );
+            } else {
+                let throughput = final_received as f64 / elapsed.as_secs_f64();
+                let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
+                let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
+                let avg_backlog = if backlog_count > 0 {
+                    backlog_sum / backlog_count
+                } else {
+                    0
+                };
+                info!("Messages sent: {}, Data sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, avg backlog: {}%)",
+                    final_sent, format_bytes(total_data_sent), final_received, throughput, min_rate, max_rate, avg_backlog
+                );
+            }
         }
     });
 
@@ -2288,8 +2440,13 @@ async fn main() -> Result<()> {
     let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
     let final_received = measurer.messages_received.load(Ordering::Relaxed);
 
-    if args.debug_fetch || args.debug_produce || final_received == 0 || final_sent == 0 {
-        println!("\n🔍 CONSUMER PERFORMANCE ANALYSIS");
+    let show_troubleshooting = args.debug_fetch
+        || args.debug_produce
+        || final_sent == 0
+        || (args.produce_only.is_none() && final_received == 0);
+
+    if show_troubleshooting {
+        println!("\n🔍 PERFORMANCE ANALYSIS");
         println!("================================");
 
         if final_sent == 0 {
