@@ -495,7 +495,8 @@ impl Producer {
 
         let mut pending_futures = Vec::new();
 
-        while Instant::now() < end_time {
+        // When bytes_target is specified, ignore time limit and run until target is reached
+        while bytes_target.is_some() || Instant::now() < end_time {
             // Check if we've reached the bytes target (if specified)
             if let Some(target) = bytes_target {
                 if bytes_sent.load(Ordering::Relaxed) >= target {
@@ -1909,7 +1910,8 @@ impl ThroughputMeasurer {
         let mut max_rate = 0.0f64;
 
         // Main measurement loop with concurrent animation and rate calculation
-        while Instant::now() < end_time {
+        // When bytes_target is specified, ignore time limit and run until target is reached
+        while bytes_target.is_some() || Instant::now() < end_time {
             // Check if bytes target reached (if specified)
             if let Some(target) = bytes_target {
                 if self.bytes_sent.load(Ordering::Relaxed) >= target {
@@ -1938,26 +1940,37 @@ impl ThroughputMeasurer {
                         }
                     };
 
-                    // Calculate current backlog
-                    let current_sent = self.messages_sent.load(Ordering::Relaxed);
-                    let current_received = self.messages_received.load(Ordering::Relaxed);
-                    let backlog = current_sent.saturating_sub(current_received);
-
                     // Build status string for display
-                    let backlog_percentage = (backlog as f64 / max_backlog as f64 * 100.0).min(100.0);
+                    let status = if produce_only {
+                        // In produce-only mode, show data sent instead of backlog
+                        let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+                        format!(
+                            "{:.0} msg/s (min: {:.0}, max: {:.0}, sent: {})",
+                            current_rate,
+                            if min_rate > 1e9 { 0.0 } else { min_rate },
+                            max_rate,
+                            format_bytes(bytes_sent)
+                        )
+                    } else {
+                        // Normal mode: show backlog percentage
+                        let current_sent = self.messages_sent.load(Ordering::Relaxed);
+                        let current_received = self.messages_received.load(Ordering::Relaxed);
+                        let backlog = current_sent.saturating_sub(current_received);
+                        let backlog_percentage = (backlog as f64 / max_backlog as f64 * 100.0).min(100.0);
 
-                    // Track backlog percentage for average calculation
-                    let backlog_percentage_int = backlog_percentage as u64;
-                    self.backlog_percentage_sum.fetch_add(backlog_percentage_int, Ordering::Relaxed);
-                    self.backlog_measurement_count.fetch_add(1, Ordering::Relaxed);
+                        // Track backlog percentage for average calculation
+                        let backlog_percentage_int = backlog_percentage as u64;
+                        self.backlog_percentage_sum.fetch_add(backlog_percentage_int, Ordering::Relaxed);
+                        self.backlog_measurement_count.fetch_add(1, Ordering::Relaxed);
 
-                    let status = format!(
-                        "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: {:.1}%)",
-                        current_rate,
-                        if min_rate > 1e9 { 0.0 } else { min_rate },
-                        max_rate,
-                        backlog_percentage
-                    );
+                        format!(
+                            "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: {:.1}%)",
+                            current_rate,
+                            if min_rate > 1e9 { 0.0 } else { min_rate },
+                            max_rate,
+                            backlog_percentage
+                        )
+                    };
 
                     // Update the visual display with current metrics
                     self.animator.draw_frame(position, direction, &status);
