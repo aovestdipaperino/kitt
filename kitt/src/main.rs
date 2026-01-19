@@ -83,81 +83,13 @@ pub const LED_MOVEMENT_SPEED: usize = 2;
 /// Ensure LED_MOVEMENT_SPEED is reasonable relative to this width.
 pub const LED_BAR_WIDTH: usize = 25;
 
-/// Calculate the Greatest Common Divisor of two numbers
-fn gcd(a: usize, b: usize) -> usize {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
-    }
-}
-
-/// Calculate the Least Common Multiple of two numbers
-fn lcm(a: usize, b: usize) -> usize {
-    a * b / gcd(a, b)
-}
-
-/// Verify CRC32-C of a Kafka record batch
-///
-/// Kafka record batch format (v2):
-/// - baseOffset: int64 (8 bytes) - offset 0
-/// - batchLength: int32 (4 bytes) - offset 8
-/// - partitionLeaderEpoch: int32 (4 bytes) - offset 12
-/// - magic: int8 (1 byte) - offset 16
-/// - crc: int32 (4 bytes) - offset 17
-/// - attributes onwards: covered by CRC - offset 21
-///
-/// Returns Ok(batch_length) if CRC matches, Err with details if not
-fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
-    // Minimum size for a record batch header
-    if data.len() < 21 {
-        return Err(anyhow!("Record batch too short: {} bytes", data.len()));
-    }
-
-    // Read batch length (offset 8, 4 bytes, big-endian)
-    let batch_length = i32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-
-    // Total batch size = 8 (baseOffset) + 4 (batchLength) + batchLength
-    let total_batch_size = 12 + batch_length;
-    if data.len() < total_batch_size {
-        return Err(anyhow!(
-            "Incomplete record batch: expected {} bytes, got {}",
-            total_batch_size,
-            data.len()
-        ));
-    }
-
-    // Read magic byte (offset 16)
-    let magic = data[16];
-    if magic != 2 {
-        // Only verify CRC for magic version 2 (modern format)
-        debug!("Skipping CRC check for magic version {}", magic);
-        return Ok(total_batch_size);
-    }
-
-    // Read stored CRC (offset 17, 4 bytes, big-endian)
-    let stored_crc = u32::from_be_bytes([data[17], data[18], data[19], data[20]]);
-
-    // Compute CRC32-C over data from attributes (offset 21) to end of batch
-    let crc_data = &data[21..total_batch_size];
-    let computed_crc = crc32c::crc32c(crc_data);
-
-    if stored_crc != computed_crc {
-        return Err(anyhow!(
-            "CRC mismatch: stored=0x{:08x}, computed=0x{:08x}",
-            stored_crc,
-            computed_crc
-        ));
-    }
-
-    Ok(total_batch_size)
-}
-
 mod kafka_client;
 pub mod profiling;
+mod utils;
 use kafka_client::KafkaClient;
 use profiling::KittOperation;
 use quantum_pulse::profile;
+use utils::{format_bytes, lcm, parse_bytes, verify_record_batch_crc};
 
 /// Command-line arguments for configuring the throughput test
 #[derive(Parser)]
@@ -292,54 +224,6 @@ impl MessageSize {
         }
     }
 
-}
-
-/// Formats a byte count into a human-readable string (KB, MB, GB, etc.)
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} bytes", bytes)
-    }
-}
-
-/// Parses a human-readable byte size string (e.g., "1GB", "500MB", "1024KB") into bytes
-fn parse_bytes(s: &str) -> Result<u64> {
-    let s = s.trim().to_uppercase();
-
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    const TB: u64 = GB * 1024;
-
-    // Find where the numeric part ends
-    let numeric_end = s
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(s.len());
-
-    let (num_str, unit) = s.split_at(numeric_end);
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| anyhow!("Invalid number in size: {}", s))?;
-
-    let multiplier = match unit.trim() {
-        "" | "B" => 1,
-        "K" | "KB" | "KIB" => KB,
-        "M" | "MB" | "MIB" => MB,
-        "G" | "GB" | "GIB" => GB,
-        "T" | "TB" | "TIB" => TB,
-        _ => return Err(anyhow!("Unknown unit in size: {}", unit)),
-    };
-
-    Ok((num * multiplier as f64) as u64)
 }
 
 /// Strategy for generating message keys
