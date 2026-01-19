@@ -16,6 +16,8 @@ use std::{
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+use producer::ProduceConfig;
+
 /// Base maximum number of pending messages allowed before applying backpressure
 /// This prevents memory exhaustion during high-throughput testing
 /// Will be multiplied by fetch_delay to compensate for delayed consumer start
@@ -321,52 +323,72 @@ fn log_test_timing(args: &Args, measurement_duration: Duration, total_test_durat
     }
 }
 
+/// Configuration for the measurement loop
+///
+/// This struct groups the parameters needed for running the measurement,
+/// reducing the number of arguments passed to the function.
+struct MeasurementConfig {
+    /// Whether to validate messages
+    message_validation: bool,
+    /// Whether in produce-only mode (no consumers)
+    produce_only: bool,
+    /// Total test duration including fetch delay
+    total_test_duration: Duration,
+    /// Duration of the measurement phase
+    measurement_duration: Duration,
+    /// Maximum backlog before applying backpressure
+    max_backlog: u64,
+    /// Optional target bytes to produce
+    produce_only_target: Option<u64>,
+    /// Fetch delay before starting consumers
+    fetch_delay: u64,
+}
+
 /// Run the measurement loop with producers and consumers
 async fn run_measurement(
-    args: &Args,
+    config: MeasurementConfig,
     producers: Vec<Producer>,
     consumers: Vec<Consumer>,
     measurer: ThroughputMeasurer,
-    total_test_duration: Duration,
-    measurement_duration: Duration,
-    max_backlog: u64,
-    produce_only_target: Option<u64>,
 ) {
-    let num_producer_threads = producers.len();
-    let num_consumer_threads = consumers.len();
+    let MeasurementConfig {
+        message_validation,
+        produce_only,
+        total_test_duration,
+        measurement_duration,
+        max_backlog,
+        produce_only_target,
+        fetch_delay,
+    } = config;
 
     // Start multiple producer and consumer threads
     let mut producer_handles = Vec::new();
     let mut consumer_handles = Vec::new();
 
-    for i in 0..num_producer_threads {
-        let producer = producers[i].clone();
+    for producer in producers {
         let messages_sent = measurer.messages_sent.clone();
         let bytes_sent = measurer.bytes_sent.clone();
         let messages_received = measurer.messages_received.clone();
-        let message_validation = args.message_validation;
         let bytes_target = produce_only_target;
         let producer_handle = tokio::spawn(async move {
             producer
-                .produce_messages(
-                    total_test_duration,
+                .produce_messages(ProduceConfig {
+                    duration: total_test_duration,
                     messages_sent,
                     bytes_sent,
                     messages_received,
                     max_backlog,
                     message_validation,
                     bytes_target,
-                )
+                })
                 .await
         });
         producer_handles.push(producer_handle);
     }
 
-    if args.produce_only.is_none() {
-        for i in 0..num_consumer_threads {
-            let consumer = consumers[i].clone();
+    if !produce_only {
+        for consumer in consumers {
             let messages_received = measurer.messages_received.clone();
-            let message_validation = args.message_validation;
             let consumer_handle = tokio::spawn(async move {
                 consumer
                     .consume_messages(total_test_duration, messages_received, message_validation)
@@ -378,9 +400,6 @@ async fn run_measurement(
 
     let measurement_handle = tokio::spawn({
         let measurer = measurer.clone();
-        let produce_only = args.produce_only.is_some();
-        let bytes_target = produce_only_target;
-        let fetch_delay = args.fetch_delay;
         async move {
             let (min_rate, max_rate, elapsed) = measurer
                 .measure(
@@ -389,7 +408,7 @@ async fn run_measurement(
                     max_backlog,
                     fetch_delay,
                     produce_only,
-                    bytes_target,
+                    produce_only_target,
                 )
                 .await;
 
@@ -673,14 +692,18 @@ async fn main() -> Result<()> {
 
     // Run the measurement
     run_measurement(
-        &args,
+        MeasurementConfig {
+            message_validation: args.message_validation,
+            produce_only: args.produce_only.is_some(),
+            total_test_duration,
+            measurement_duration,
+            max_backlog,
+            produce_only_target,
+            fetch_delay: args.fetch_delay,
+        },
         producers,
         consumers,
         measurer.clone(),
-        total_test_duration,
-        measurement_duration,
-        max_backlog,
-        produce_only_target,
     )
     .await;
 

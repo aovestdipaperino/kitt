@@ -21,6 +21,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use tracing::{debug, error};
 
+/// Configuration for the `produce_messages` method
+///
+/// This struct groups the parameters needed for message production,
+/// reducing the number of arguments passed to the function.
+pub struct ProduceConfig {
+    /// How long to continue producing messages
+    pub duration: Duration,
+    /// Shared counter for tracking sent messages
+    pub messages_sent: Arc<AtomicU64>,
+    /// Shared counter for tracking bytes sent
+    pub bytes_sent: Arc<AtomicU64>,
+    /// Shared counter for tracking received messages (for backpressure)
+    pub messages_received: Arc<AtomicU64>,
+    /// Maximum number of pending messages before applying backpressure
+    pub max_backlog: u64,
+    /// Whether to validate produce responses
+    pub message_validation: bool,
+    /// Optional target bytes to produce (overrides duration if set)
+    pub bytes_target: Option<u64>,
+}
+
 /// Kafka message producer that sends messages to a specific topic
 /// Each producer instance runs in its own thread and targets specific partitions
 #[derive(Clone)]
@@ -91,27 +112,21 @@ impl Producer {
     /// - High-throughput batch processing
     ///
     /// # Arguments
-    /// * `duration` - How long to continue producing messages
-    /// * `messages_sent` - Shared counter for tracking sent messages
-    /// * `bytes_sent` - Shared counter for tracking bytes sent
-    /// * `messages_received` - Shared counter for tracking received messages (for backpressure)
-    /// * `max_backlog` - Maximum number of pending messages before applying backpressure
-    /// * `message_validation` - Whether to validate produce responses
-    /// * `bytes_target` - Optional target bytes to produce (overrides duration if set)
+    /// * `config` - Configuration for message production including duration, counters, and options
     ///
     /// # Returns
     /// * `Ok(())` - When production completes successfully
     /// * `Err(anyhow::Error)` - If Kafka communication or encoding fails
-    pub async fn produce_messages(
-        &self,
-        duration: Duration,
-        messages_sent: Arc<AtomicU64>,
-        bytes_sent: Arc<AtomicU64>,
-        messages_received: Arc<AtomicU64>,
-        max_backlog: u64,
-        message_validation: bool,
-        bytes_target: Option<u64>,
-    ) -> Result<()> {
+    pub async fn produce_messages(&self, config: ProduceConfig) -> Result<()> {
+        let ProduceConfig {
+            duration,
+            messages_sent,
+            bytes_sent,
+            messages_received,
+            max_backlog,
+            message_validation,
+            bytes_target,
+        } = config;
         let end_time = Instant::now() + duration;
 
         // Determine partition selection strategy based on configuration
@@ -579,13 +594,11 @@ impl Producer {
                 }
 
                 // Check for valid offsets on success
-                if partition_response.error_code == 0 {
-                    if partition_response.base_offset < 0 {
-                        diagnostics.push(format!(
-                            "P{}: Invalid base_offset={}",
-                            partition_id, partition_response.base_offset
-                        ));
-                    }
+                if partition_response.error_code == 0 && partition_response.base_offset < 0 {
+                    diagnostics.push(format!(
+                        "P{}: Invalid base_offset={}",
+                        partition_id, partition_response.base_offset
+                    ));
                 }
             }
         }

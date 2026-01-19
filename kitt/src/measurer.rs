@@ -174,7 +174,7 @@ impl ThroughputMeasurer {
                         }
                     } else {
                         // Moving left: bounce off left edge
-                        if position <= LED_MOVEMENT_SPEED - 1 {
+                        if position < LED_MOVEMENT_SPEED {
                             direction = 1;
                             LED_MOVEMENT_SPEED
                         } else {

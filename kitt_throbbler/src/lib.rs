@@ -254,11 +254,7 @@ impl KnightRiderAnimator {
             // When moving left, trail extends to the right
             let trail_pos = if direction > 0 {
                 // Moving right - trail is behind (to the left)
-                if position >= i {
-                    position - i
-                } else {
-                    0
-                }
+                position.saturating_sub(i)
             } else {
                 // Moving left - trail is behind (to the right)
                 if position + i < self.led_count {
@@ -497,7 +493,7 @@ impl KnightRiderAnimator {
             }
 
             // Adjust speed based on simulated rate
-            let speed_factor = 1.0 - (rate / max_rate_value).min(1.0).max(0.0);
+            let speed_factor = 1.0 - (rate / max_rate_value).clamp(0.0, 1.0);
             let delay_ms = base_speed_ms + (speed_factor * 80.0) as u64;
             sleep(Duration::from_millis(delay_ms)).await;
         }
