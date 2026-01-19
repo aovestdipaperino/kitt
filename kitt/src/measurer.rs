@@ -189,14 +189,21 @@ impl ThroughputMeasurer {
 
                     // Build status string for display
                     let status = if produce_only {
-                        // In produce-only mode, show data sent instead of backlog
+                        // In produce-only mode, show data sent and avg throughput
                         let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+                        let elapsed_secs = start_time.elapsed().as_secs_f64();
+                        let avg_mbps = if elapsed_secs > 0.0 {
+                            bytes_sent as f64 / elapsed_secs / (1024.0 * 1024.0)
+                        } else {
+                            0.0
+                        };
                         format!(
-                            "{:.0} msg/s (min: {:.0}, max: {:.0}, sent: {})",
+                            "{:.0} msg/s (min: {:.0}, max: {:.0}, sent: {}, avg: {:.1} MB/s)",
                             current_rate,
                             if min_rate > 1e9 { 0.0 } else { min_rate },
                             max_rate,
-                            format_bytes(bytes_sent)
+                            format_bytes(bytes_sent),
+                            avg_mbps
                         )
                     } else {
                         // Normal mode: show backlog percentage
