@@ -115,9 +115,9 @@ impl ThroughputMeasurer {
         }
         let start_time = Instant::now();
         let end_time = start_time + duration;
-        // Timer for animation updates (smooth visual feedback)
+        // 100ms animation interval provides smooth visual feedback at ~10fps
         let mut animation_interval = interval(Duration::from_millis(100));
-        // Timer for throughput calculations (performance measurement)
+        // 500ms rate interval balances responsiveness vs noise in measurements
         let mut rate_interval = interval(Duration::from_millis(500));
 
         // Baseline counters for rate calculation
@@ -148,16 +148,17 @@ impl ThroughputMeasurer {
         // Start audio playback for the measurement duration (audio is already configured in constructor)
         let _audio_handle = self.animator.start_audio();
 
-        // Animation state variables
-        let mut position = 0; // Current LED position in the display
-        let mut direction = 1; // Animation direction: 1 = right, -1 = left
-                               // Throughput tracking variables
+        // Animation state: position bounces between 0 and LED_BAR_WIDTH
+        let mut position = 0;
+        let mut direction = 1; // 1 = moving right, -1 = moving left
+
+        // Rate tracking: min starts at MAX so first valid measurement becomes minimum
         let mut current_rate = 0.0f64;
-        let mut min_rate = f64::MAX; // Initialize to maximum to find true minimum
+        let mut min_rate = f64::MAX;
         let mut max_rate = 0.0f64;
 
-        // Main measurement loop with concurrent animation and rate calculation
-        // When bytes_target is specified, ignore time limit and run until target is reached
+        // Main loop uses tokio::select! to run animation and rate calculation concurrently.
+        // This avoids blocking either task while maintaining precise timing for both.
         while bytes_target.is_some() || Instant::now() < end_time {
             // Check if bytes target reached (if specified)
             if let Some(target) = bytes_target {
@@ -168,17 +169,16 @@ impl ThroughputMeasurer {
 
             select! {
                 _ = animation_interval.tick() => {
-                    // Update Knight Rider animation position with bouncing behavior
+                    // Bounce logic: reverse direction when hitting edges.
+                    // We check LED_MOVEMENT_SPEED from edge to prevent overshooting.
                     position = if direction > 0 {
-                        // Moving right: bounce off right edge
-                        if position >= (LED_BAR_WIDTH - LED_MOVEMENT_SPEED) { // Account for movement speed
+                        if position >= (LED_BAR_WIDTH - LED_MOVEMENT_SPEED) {
                             direction = -1;
-                            LED_BAR_WIDTH - LED_MOVEMENT_SPEED // One step before the edge
+                            LED_BAR_WIDTH - LED_MOVEMENT_SPEED
                         } else {
                             position + LED_MOVEMENT_SPEED
                         }
                     } else {
-                        // Moving left: bounce off left edge
                         if position < LED_MOVEMENT_SPEED {
                             direction = 1;
                             LED_MOVEMENT_SPEED
@@ -223,7 +223,8 @@ impl ThroughputMeasurer {
                     self.animator.draw_frame(position, direction, &status);
                 }
                 _ = rate_interval.tick() => {
-                    // Calculate instantaneous throughput rate
+                    // Calculate instantaneous rate as delta_messages / delta_time.
+                    // Using deltas instead of cumulative rate gives more responsive feedback.
                     let now = Instant::now();
                     let current_count = if produce_only {
                         self.messages_sent.load(Ordering::Relaxed)
@@ -233,20 +234,19 @@ impl ThroughputMeasurer {
                     let time_elapsed = now.duration_since(last_rate_time).as_secs_f64();
 
                     if time_elapsed > 0.0 {
-                        // Calculate messages per second since last measurement
                         current_rate = (current_count - last_count) as f64 / time_elapsed;
 
-                        // Track performance statistics (ignore initial zero rates)
+                        // Skip zero rates (e.g., startup) to avoid skewing min
                         if current_rate > 0.0 {
                             if min_rate == f64::MAX {
-                                min_rate = current_rate; // First valid measurement
+                                min_rate = current_rate;
                             } else {
                                 min_rate = min_rate.min(current_rate);
                             }
                             max_rate = max_rate.max(current_rate);
                         }
 
-                        // Update baseline for next calculation
+                        // Slide the measurement window forward
                         last_count = current_count;
                         last_rate_time = now;
                     }

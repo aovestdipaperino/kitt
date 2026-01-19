@@ -137,8 +137,9 @@ impl Producer {
             0 // Not used in random mode
         };
 
-        // Send 1 message per partition in each batch request
-        const MAX_PENDING: usize = 20; // Maximum concurrent batched requests
+        // MAX_PENDING limits in-flight requests to avoid overwhelming the broker.
+        // 20 balances throughput (enough pipelining) vs memory (bounded queues).
+        const MAX_PENDING: usize = 20;
 
         let mut pending_futures = Vec::new();
 
@@ -157,21 +158,20 @@ impl Producer {
             let backlog = sent.saturating_sub(received);
 
             if backlog > max_backlog {
-                // Backlog exceeded threshold - pause to let consumers catch up
+                // Backpressure: pause producer when consumer falls behind to prevent unbounded
+                // memory growth. 10ms is short enough to maintain throughput when consumer recovers.
                 profile!(KittOperation::BacklogWaiting, {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 });
-                // Yield to allow consumers to continue processing
-                //tokio::task::yield_now().await;
                 continue;
             }
 
             // Create produce request with 1 message per partition
             let mut request = ProduceRequest::default();
+            // acks=-1 (all): wait for all replicas. Strongest durability guarantee.
             request.acks = -1;
+            // 30s timeout allows for slow replicas without failing prematurely
             request.timeout_ms = 30000;
-            // Disable idempotent producer to avoid sequence number conflicts
-            // when multiple threads use different producer_ids
 
             let mut topic_data = TopicProduceData::default();
             topic_data.name = TopicName(StrBytes::from_string(self.topic.clone()));
@@ -241,18 +241,17 @@ impl Producer {
                     // Generate message key based on configured strategy (different key for each message)
                     let key = self.key_strategy.generate_key();
 
-                    // Create a Kafka record
-                    // NOTE: offset is always 0 in PRODUCE requests - the broker assigns actual offsets
-                    // The broker-assigned offset will be returned in the ProduceResponse.base_offset
+                    // Idempotence is disabled (producer_id=-1) because multiple threads would need
+                    // coordinated sequence numbers, which adds complexity without benefit for throughput testing.
                     records.push(Record {
                         transactional: false,
                         control: false,
                         partition_leader_epoch: 0,
-                        producer_id: -1, // Disable idempotent producer (-1 means not using idempotence)
-                        producer_epoch: -1, // Disable idempotent producer
+                        producer_id: -1,  // -1 disables idempotence
+                        producer_epoch: -1,
                         timestamp_type: TimestampType::Creation,
-                        offset: 0,    // Always 0 for producers - broker assigns actual offset
-                        sequence: -1, // Disable sequence tracking for non-idempotent producer
+                        offset: 0,    // Broker assigns actual offset; 0 is placeholder
+                        sequence: -1, // Required when idempotence disabled
                         timestamp,
                         key,
                         value: Some(Bytes::from(payload)),
@@ -341,7 +340,8 @@ impl Producer {
             });
             pending_futures.push(future);
 
-            // Manage concurrent request limit
+            // Non-blocking drain: only reap completed futures when at capacity.
+            // This avoids blocking on slow requests while maintaining the MAX_PENDING limit.
             if pending_futures.len() >= MAX_PENDING {
                 let mut i = 0;
                 while i < pending_futures.len() {

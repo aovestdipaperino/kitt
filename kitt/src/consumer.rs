@@ -96,12 +96,13 @@ impl Consumer {
 
         let end_time = Instant::now() + duration;
 
-        // Each thread handles its assigned partitions (no overlap with other threads)
+        // Partition assignment: thread N handles partitions [N*count, (N+1)*count).
+        // This ensures no overlap - each partition has exactly one consumer.
         let start_partition = self.thread_id * self.consumer_partitions_per_thread as usize;
         let partition_count = self.consumer_partitions_per_thread as usize;
 
-        // Track current offset for each partition this consumer handles
-        // Starting from offset 0 (beginning of each partition)
+        // Per-partition offset tracking. Starting at 0 reads from the beginning.
+        // Invariant: offsets[i] always points to the next message to fetch.
         let mut offsets = vec![0i64; partition_count];
 
         // Add periodic logging to track consumer activity
@@ -126,10 +127,10 @@ impl Consumer {
             {
                 let mut fetch_partition = FetchPartition::default();
                 fetch_partition.partition = partition as i32;
-                fetch_partition.current_leader_epoch = -1; // Don't check leader epoch
-                fetch_partition.fetch_offset = offsets[idx]; // Start from tracked offset
-                fetch_partition.log_start_offset = -1; // Let broker determine log start
-                fetch_partition.partition_max_bytes = 1024 * 1024; // 1MB per partition limit
+                fetch_partition.current_leader_epoch = -1; // -1 skips epoch check (simpler but less safe)
+                fetch_partition.fetch_offset = offsets[idx];
+                fetch_partition.log_start_offset = -1;  // Broker will tell us where log starts
+                fetch_partition.partition_max_bytes = 1024 * 1024; // 1MB per partition prevents one partition from starving others
 
                 debug!(
                     "Thread {}: requesting partition {} at offset {}",
@@ -152,16 +153,16 @@ impl Consumer {
             fetch_topic.topic = TopicName(StrBytes::from_string(self.topic.clone()));
             fetch_topic.partitions = fetch_partitions;
 
-            // Create fetch request with optimized settings for high throughput
+            // Fetch parameters tuned for throughput testing:
             let mut request = FetchRequest::default();
-            request.max_wait_ms = 1000; // Maximum wait time for data availability
-            request.min_bytes = 1; // Minimum bytes to return (return immediately if any data)
-            request.max_bytes = 50 * 1024 * 1024; // 50MB total response size limit
-            request.isolation_level = 0; // Read uncommitted (highest performance)
-            request.session_id = 0; // Not using fetch sessions
-            request.session_epoch = -1; // Not using fetch sessions
+            request.max_wait_ms = 1000;  // Wait up to 1s if no data; balances latency vs CPU usage
+            request.min_bytes = 1;       // Return immediately when any data available
+            request.max_bytes = 50 * 1024 * 1024; // 50MB cap prevents memory spikes
+            request.isolation_level = 0; // 0=READ_UNCOMMITTED for maximum speed (no transaction overhead)
+            request.session_id = 0;      // Fetch sessions disabled for simplicity
+            request.session_epoch = -1;
             request.topics.push(fetch_topic);
-            request.rack_id = StrBytes::from_static_str(""); // No rack awareness
+            request.rack_id = StrBytes::from_static_str("");
 
             // Send fetch request and process response
             debug!(
@@ -170,8 +171,9 @@ impl Consumer {
             );
             let version = self.client.get_supported_version(ApiKey::Fetch, 4);
 
-            // Add timeout to prevent hanging indefinitely
-            let fetch_timeout = Duration::from_millis(5000); // 5 second timeout
+            // 5s timeout is longer than max_wait_ms (1s) to account for network RTT.
+            // If this triggers, the broker is likely unresponsive.
+            let fetch_timeout = Duration::from_millis(5000);
             match tokio::time::timeout(
                 fetch_timeout,
                 profile!(KittOperation::MessageConsume, {
@@ -311,12 +313,10 @@ impl Consumer {
                                                         if partition_message_count > 0 {
                                                             total_messages +=
                                                                 partition_message_count;
-                                                            // Advance offset by the actual number of messages
+                                                            // Offset advances by message count since Kafka offsets are per-message.
+                                                            // This assumes batch.base_offset + record_index = message offset.
                                                             offsets[local_partition_idx] +=
                                                                 partition_message_count as i64;
-                                                        } else {
-                                                            // No messages in record batches - advance by 1 to make progress
-                                                            //offsets[local_partition_idx] += 1;
                                                         }
 
                                                         debug!(
@@ -332,23 +332,22 @@ impl Consumer {
                                                             partition_response.log_start_offset,
                                                             partition_response.high_watermark
                                                         );
-                                                        // Empty records - always advance offset to make progress
-                                                        // If we're behind log_start_offset, jump to it; otherwise increment
+                                                        // Empty response handling: jump to valid offset to avoid getting stuck.
+                                                        // log_start_offset is the earliest available; high_watermark is latest committed.
                                                         if offsets[local_partition_idx]
                                                             < partition_response.log_start_offset
                                                         {
+                                                            // Our offset was compacted away; jump to oldest available
                                                             offsets[local_partition_idx] =
                                                                 partition_response.log_start_offset;
                                                         } else if offsets[local_partition_idx]
                                                             < partition_response.high_watermark
                                                         {
-                                                            // If there should be messages but we got empty response, advance to high watermark
+                                                            // Gap in data; skip to latest to resume progress
                                                             offsets[local_partition_idx] =
                                                                 partition_response.high_watermark;
-                                                        } else {
-                                                            // At or past high watermark, just advance by 1 to keep polling for new messages
-                                                            //offsets[local_partition_idx] += 1;
                                                         }
+                                                        // At high_watermark means we're caught up; wait for new messages
                                                     }
                                                 } else {
                                                     debug!(
@@ -489,7 +488,8 @@ impl Consumer {
                 fetch_count = 0;
             }
 
-            // Yield control to allow other tasks to run (cooperative multitasking)
+            // Yield allows other tokio tasks (producers, measurer) to make progress.
+            // Essential for cooperative scheduling in single-threaded runtime mode.
             tokio::task::yield_now().await;
 
             debug!(

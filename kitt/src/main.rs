@@ -5,6 +5,8 @@
 
 use mimalloc::MiMalloc;
 
+// MiMalloc provides better performance than the system allocator for high-frequency
+// small allocations typical in message-heavy workloads
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -23,9 +25,9 @@ use tracing::{info, warn};
 
 use producer::ProduceConfig;
 
-/// Base maximum number of pending messages allowed before applying backpressure
-/// This prevents memory exhaustion during high-throughput testing
-/// Will be multiplied by fetch_delay to compensate for delayed consumer start
+/// Base maximum number of pending messages allowed before applying backpressure.
+/// 1000 is chosen to allow burst absorption while preventing unbounded growth.
+/// Will be multiplied by fetch_delay to compensate for delayed consumer start.
 const BASE_MAX_BACKLOG: u64 = 1000;
 
 mod args;
@@ -65,9 +67,11 @@ fn setup_logging() {
 /// Returns (num_producer_threads, num_consumer_threads, total_partitions)
 fn calculate_thread_config(args: &Args) -> Result<(usize, usize, i32)> {
     let (num_producer_threads, num_consumer_threads, total_partitions) = if args.sticky {
-        // Legacy sticky mode: use LCM-based calculation
+        // Sticky mode uses LCM to ensure each thread gets a whole number of partitions.
+        // This guarantees no partition is shared between threads, maximizing locality.
         let base_threads = args.threads.unwrap_or(4) as usize;
 
+        // LCM ensures total_partitions is evenly divisible by both producer and consumer counts
         let lcm_partitions_per_thread = lcm(
             args.producer_partitions_per_thread as usize,
             args.consumer_partitions_per_thread as usize,
@@ -81,7 +85,8 @@ fn calculate_thread_config(args: &Args) -> Result<(usize, usize, i32)> {
 
         (num_producer_threads, num_consumer_threads, total_partitions)
     } else {
-        // New random mode: consumer-driven partition calculation
+        // Random mode: partition count is driven by consumers since they need dedicated partitions.
+        // Producers can write to any partition, so they don't constrain the count.
         let num_producer_threads = args.producer_threads as usize;
         let num_consumer_threads = args.consumer_threads as usize;
         let total_partitions =
@@ -366,7 +371,8 @@ async fn run_measurement(
         fetch_delay,
     } = config;
 
-    // Start multiple producer and consumer threads
+    // Spawn producers and consumers as separate tokio tasks for true parallelism.
+    // Each task gets its own Kafka connection to avoid head-of-line blocking.
     let mut producer_handles = Vec::new();
     let mut consumer_handles = Vec::new();
 
@@ -444,7 +450,8 @@ async fn run_measurement(
         }
     });
 
-    // Wait for all tasks to complete
+    // Wait for all tasks to complete. Order matters: producers first (they drive the test),
+    // then consumers, then measurement (which needs final counts).
     for handle in producer_handles {
         let _ = handle.await;
     }
@@ -640,6 +647,8 @@ async fn main() -> Result<()> {
         .create_topic(&topic_name, total_partitions, 1)
         .await
         .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
+    // 3s delay allows Kafka to propagate metadata to all brokers before clients connect.
+    // Without this, consumers may get UNKNOWN_TOPIC_OR_PARTITION errors.
     info!("Waiting for topic to be ready...");
     sleep(Duration::from_secs(3)).await;
 
