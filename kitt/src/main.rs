@@ -9,10 +9,8 @@ use clap::Parser;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::{
-    sync::{
-        atomic::Ordering,
-        Arc,
-    },
+    collections::HashMap,
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 use tokio::time::sleep;
@@ -39,22 +37,12 @@ use profiling::KittOperation;
 use quantum_pulse::profile;
 use utils::{format_bytes, lcm, parse_bytes};
 
-/// Main entry point for the Kafka Integrated Throughput Testing (KITT) tool
-///
-/// This function orchestrates the complete throughput test workflow:
-/// 1. Parse command-line arguments and validate configuration
-/// 2. Establish connection to Kafka broker
-/// 3. Create temporary test topic with specified parameters
-/// 4. Launch producer and consumer threads for parallel processing
-/// 5. Measure and display real-time throughput metrics
-/// 6. Clean up resources and report final results
+// ============================================================================
+// Helper Functions for main() orchestration
+// ============================================================================
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Profiling is now handled automatically by quantum-pulse
-
-    // Initialize structured logging for better observability
-    // Filter out noisy audio library logs and default to info level
+/// Initialize tracing subscriber for structured logging
+fn setup_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::filter::EnvFilter::try_from_default_env()
@@ -63,61 +51,12 @@ async fn main() -> Result<()> {
                 .add_directive("symphonia_bundle_mp3=warn".parse().unwrap()),
         )
         .init();
+}
 
-    // Parse and validate command-line arguments
-    let args = Args::parse();
-
-    // If profile demo requested, run it and exit
-    if args.profile_demo {
-        return run_profile_demo().await;
-    }
-
-    // Run diagnostics tests if requested
-    if args.debug_fetch {
-        consumer::test_fetch_response_validation();
-        println!("🔧 FETCH Response Diagnostics Enabled - Enhanced logging will show detailed error analysis");
-        println!("📋 Check the following when consumer isn't receiving messages:");
-        println!("   1. Error codes in partition responses (authentication, authorization, topic existence)");
-        println!("   2. Offset positioning (out of range, beyond high watermark)");
-        println!("   3. Records field presence and content");
-        println!("   4. Broker protocol version compatibility");
-        println!("   5. Network connectivity and broker availability");
-        println!();
-    }
-
-    if args.debug_produce {
-        producer::test_produce_response_validation();
-        println!("🔧 PRODUCE Response Diagnostics Enabled - Enhanced logging will validate message delivery");
-        println!(
-            "ℹ️  NOTE: Offset=0 in PRODUCE requests is CORRECT - brokers assign actual offsets"
-        );
-        println!("📋 Check the following when producer isn't sending messages:");
-        println!("   1. Error codes in partition responses (authentication, authorization, topic existence)");
-        println!("   2. Partition leadership (broker must be leader for partition)");
-        println!("   3. Message size limits (check broker max.message.bytes setting)");
-        println!(
-            "   4. Offset assignment tracking (successful responses show broker-assigned offsets)"
-        );
-        println!("   5. Network connectivity and broker availability");
-        println!("   6. Topic existence and partition count on target broker");
-        println!();
-    }
-
-    let message_size = profile!(KittOperation::MessageSizeGeneration, {
-        MessageSize::parse(&args.message_size)?
-    });
-
-    // Create key strategy from command-line argument
-    let key_strategy = KeyStrategy::from_arg(args.random_keys);
-    if let Some(pool_size) = args.random_keys {
-        if pool_size == 0 {
-            info!("Using random keys: generating unique keys on the fly");
-        } else {
-            info!("Using random keys: pool of {} pre-generated keys", pool_size);
-        }
-    }
-
-    // Calculate partitions and threads based on mode
+/// Calculate producer/consumer threads and partitions based on mode
+///
+/// Returns (num_producer_threads, num_consumer_threads, total_partitions)
+fn calculate_thread_config(args: &Args) -> Result<(usize, usize, i32)> {
     let (num_producer_threads, num_consumer_threads, total_partitions) = if args.sticky {
         // Legacy sticky mode: use LCM-based calculation
         let base_threads = args.threads.unwrap_or(4) as usize;
@@ -144,8 +83,7 @@ async fn main() -> Result<()> {
         (num_producer_threads, num_consumer_threads, total_partitions)
     };
 
-    println!("{}", include_str!("logo.txt"));
-
+    // Validate configuration
     if num_producer_threads == 0 {
         return Err(anyhow!("Producer threads must be at least 1"));
     }
@@ -162,28 +100,11 @@ async fn main() -> Result<()> {
         return Err(anyhow!("Consumer partitions per thread must be at least 1"));
     }
 
-    info!("Starting Kitt - Kafka Implementation Throughput Tool");
-    if args.sticky {
-        info!(
-            "Mode: STICKY (LCM-based) - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
-            args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
-        );
-    } else {
-        info!(
-            "Mode: RANDOM - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
-            args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
-        );
-    }
-    info!("Running for: {}s", args.duration_secs);
+    Ok((num_producer_threads, num_consumer_threads, total_partitions))
+}
 
-    // Log validation setting
-    if args.message_validation {
-        info!("🔍 Message validation: ENABLED - Response validation will be performed");
-    } else {
-        info!("⚡ Message validation: DISABLED - Optimized for maximum performance");
-    }
-
-    // Generate topic name using random adjective-noun-verb triplet
+/// Generate random adjective-noun-verb topic name
+fn generate_topic_name() -> String {
     let adjectives = [
         "brave", "quick", "silent", "happy", "bright", "calm", "eager", "fierce", "gentle",
         "jolly", "kind", "lively", "mighty", "proud", "silly", "witty", "zany", "bold", "shy",
@@ -203,83 +124,95 @@ async fn main() -> Result<()> {
     let adj = adjectives.choose(&mut rng).unwrap();
     let noun = nouns.choose(&mut rng).unwrap();
     let verb = verbs.choose(&mut rng).unwrap();
-    let topic_name = format!("topic-{}-{}-{}", adj, noun, verb);
-    info!("Test topic: {}", topic_name);
+    format!("topic-{}-{}-{}", adj, noun, verb)
+}
 
-    // Connect to Kafka for admin operations and discover API versions
-    let admin_client = Arc::new(
-        KafkaClient::connect(&args.broker)
-            .await
-            .map_err(|e| anyhow!("Failed to connect admin client: {}", e))?,
-    );
+/// Print startup information including mode, broker, partitions, and threads
+fn print_startup_info(
+    args: &Args,
+    message_size: &MessageSize,
+    num_producer_threads: usize,
+    num_consumer_threads: usize,
+    total_partitions: i32,
+) {
+    println!("{}", include_str!("logo.txt"));
 
-    // Get discovered API versions to reuse for other connections
-    let api_versions = admin_client.api_versions.clone();
-
-    // Create topic
-    admin_client
-        .create_topic(&topic_name, total_partitions, 1)
-        .await
-        .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
-
-    // Wait for topic to be ready
-    info!("Waiting for topic to be ready...");
-    sleep(Duration::from_secs(3)).await;
-
-    // Initialize components
-    let measurer = ThroughputMeasurer::with_leds(LED_BAR_WIDTH, !args.silent);
-
-    // Reset message counters
-    measurer.messages_sent.store(0, Ordering::Relaxed);
-    measurer.bytes_sent.store(0, Ordering::Relaxed);
-    measurer.messages_received.store(0, Ordering::Relaxed);
-
-    // Create multiple producer and consumer clients
-    let mut producer_clients = Vec::new();
-    let mut consumer_clients = Vec::new();
-
-    if args.produce_only.is_some() {
+    info!("Starting Kitt - Kafka Implementation Throughput Tool");
+    if args.sticky {
         info!(
-            "Creating {} producer connections (produce-only mode)...",
-            num_producer_threads
+            "Mode: STICKY (LCM-based) - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
+            args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
         );
     } else {
         info!(
-            "Creating {} producer and {} consumer connections...",
-            num_producer_threads, num_consumer_threads
+            "Mode: RANDOM - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
+            args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
         );
     }
+    info!("Running for: {}s", args.duration_secs);
 
-    // Create producer clients
+    // Log validation setting
+    if args.message_validation {
+        info!("Message validation: ENABLED - Response validation will be performed");
+    } else {
+        info!("Message validation: DISABLED - Optimized for maximum performance");
+    }
+}
+
+/// Run debug_fetch/debug_produce diagnostics if enabled
+fn run_diagnostics_if_enabled(args: &Args) {
+    if args.debug_fetch {
+        consumer::test_fetch_response_validation();
+        println!("FETCH Response Diagnostics Enabled - Enhanced logging will show detailed error analysis");
+        println!("Check the following when consumer isn't receiving messages:");
+        println!("   1. Error codes in partition responses (authentication, authorization, topic existence)");
+        println!("   2. Offset positioning (out of range, beyond high watermark)");
+        println!("   3. Records field presence and content");
+        println!("   4. Broker protocol version compatibility");
+        println!("   5. Network connectivity and broker availability");
+        println!();
+    }
+
+    if args.debug_produce {
+        producer::test_produce_response_validation();
+        println!("PRODUCE Response Diagnostics Enabled - Enhanced logging will validate message delivery");
+        println!(
+            "NOTE: Offset=0 in PRODUCE requests is CORRECT - brokers assign actual offsets"
+        );
+        println!("Check the following when producer isn't sending messages:");
+        println!("   1. Error codes in partition responses (authentication, authorization, topic existence)");
+        println!("   2. Partition leadership (broker must be leader for partition)");
+        println!("   3. Message size limits (check broker max.message.bytes setting)");
+        println!(
+            "   4. Offset assignment tracking (successful responses show broker-assigned offsets)"
+        );
+        println!("   5. Network connectivity and broker availability");
+        println!("   6. Topic existence and partition count on target broker");
+        println!();
+    }
+}
+
+/// Create producer instances
+async fn create_producers(
+    args: &Args,
+    topic_name: &str,
+    total_partitions: i32,
+    num_producer_threads: usize,
+    message_size: MessageSize,
+    key_strategy: KeyStrategy,
+    api_versions: &HashMap<i16, (i16, i16)>,
+) -> Result<Vec<Producer>> {
+    let mut producers = Vec::new();
+
     for i in 0..num_producer_threads {
         let producer_client = Arc::new(
             KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
                 .await
                 .map_err(|e| anyhow!("Failed to connect producer client {}: {}", i, e))?,
         );
-        producer_clients.push(producer_client);
-    }
-
-    // Create consumer clients (skip in produce-only mode)
-    if args.produce_only.is_none() {
-        for i in 0..num_consumer_threads {
-            let consumer_client = Arc::new(
-                KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
-                    .await
-                    .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
-            );
-            consumer_clients.push(consumer_client);
-        }
-    }
-
-    // Create producers and consumers for each thread
-    let mut producers = Vec::new();
-    let mut consumers = Vec::new();
-
-    for i in 0..num_producer_threads {
         producers.push(Producer::new(
-            producer_clients[i].clone(),
-            topic_name.clone(),
+            producer_client,
+            topic_name.to_string(),
             args.producer_partitions_per_thread,
             total_partitions,
             message_size.clone(),
@@ -290,79 +223,89 @@ async fn main() -> Result<()> {
         ));
     }
 
-    if args.produce_only.is_none() {
-        for i in 0..num_consumer_threads {
-            consumers.push(Consumer::new(
-                consumer_clients[i].clone(),
-                topic_name.clone(),
-                args.consumer_partitions_per_thread,
-                i,
-                args.fetch_delay,
-                args.record_processing_time,
-            ));
-        }
+    Ok(producers)
+}
+
+/// Create consumer instances (respecting produce_only mode)
+async fn create_consumers(
+    args: &Args,
+    topic_name: &str,
+    num_consumer_threads: usize,
+    api_versions: &HashMap<i16, (i16, i16)>,
+) -> Result<Vec<Consumer>> {
+    // Skip consumer creation in produce-only mode
+    if args.produce_only.is_some() {
+        return Ok(Vec::new());
     }
-    info!("All client connections established successfully");
 
-    // Parse produce-only data target if specified
-    let produce_only_target: Option<u64> = if let Some(ref target_str) = args.produce_only {
-        if target_str.is_empty() {
-            None // --produce-only without value: time-based
-        } else {
-            Some(parse_bytes(target_str)?) // --produce-only 1GB: data-target based
-        }
-    } else {
-        None
-    };
+    let mut consumers = Vec::new();
 
-    // Calculate adjusted max backlog to compensate for fetch delay
-    // When produce_only or record_processing_time is set, disable backpressure to measure max producer throughput
-    let max_backlog = if args.produce_only.is_some() {
+    for i in 0..num_consumer_threads {
+        let consumer_client = Arc::new(
+            KafkaClient::connect_with_versions(&args.broker, api_versions.clone())
+                .await
+                .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
+        );
+        consumers.push(Consumer::new(
+            consumer_client,
+            topic_name.to_string(),
+            args.consumer_partitions_per_thread,
+            i,
+            args.fetch_delay,
+            args.record_processing_time,
+        ));
+    }
+
+    Ok(consumers)
+}
+
+/// Calculate max backlog and log configuration
+fn calculate_max_backlog(args: &Args, produce_only_target: Option<u64>) -> u64 {
+    if args.produce_only.is_some() {
         if let Some(target) = produce_only_target {
             info!(
-                "🚀 Produce-only mode: will send {} then stop",
+                "Produce-only mode: will send {} then stop",
                 format_bytes(target)
             );
         } else {
-            info!("🚀 Produce-only mode: consumers disabled, measuring pure producer throughput");
+            info!("Produce-only mode: consumers disabled, measuring pure producer throughput");
         }
-        info!("📊 Backpressure disabled");
+        info!("Backpressure disabled");
         u64::MAX
     } else if args.record_processing_time > 0 {
         info!(
-            "🔧 Slow consumer simulation enabled: {}ms per record",
+            "Slow consumer simulation enabled: {}ms per record",
             args.record_processing_time
         );
-        info!("📊 Backpressure disabled to measure maximum producer throughput");
+        info!("Backpressure disabled to measure maximum producer throughput");
         u64::MAX
     } else if args.fetch_delay > 0 {
         let adjusted_backlog = BASE_MAX_BACKLOG * args.fetch_delay;
         info!(
-            "🔧 Fetch delay compensation enabled: {}s delay",
+            "Fetch delay compensation enabled: {}s delay",
             args.fetch_delay
         );
         info!(
-            "📊 Max backlog threshold adjusted: {} → {} ({}x multiplier)",
+            "Max backlog threshold adjusted: {} -> {} ({}x multiplier)",
             BASE_MAX_BACKLOG, adjusted_backlog, args.fetch_delay
         );
-        info!("💡 This compensates for delayed consumer start by allowing higher backlog buildup");
+        info!("This compensates for delayed consumer start by allowing higher backlog buildup");
         adjusted_backlog
     } else {
         BASE_MAX_BACKLOG
-    };
+    }
+}
 
-    // Calculate durations accounting for fetch delay
-    let measurement_duration = Duration::from_secs(args.duration_secs);
-    let total_test_duration = measurement_duration + Duration::from_secs(args.fetch_delay);
-
+/// Log test timing information
+fn log_test_timing(args: &Args, measurement_duration: Duration, total_test_duration: Duration) {
     if args.fetch_delay > 0 {
         info!(
-            "🕐 Total test duration: {}s ({}s delay + {}s measurement)",
+            "Total test duration: {}s ({}s delay + {}s measurement)",
             total_test_duration.as_secs(),
             args.fetch_delay,
             measurement_duration.as_secs()
         );
-        info!("📋 Test timing:");
+        info!("Test timing:");
         info!("   1. Producers start immediately and build backlog");
         info!("   2. Consumers wait {}s before starting", args.fetch_delay);
         info!("   3. Measurement begins after {}s delay", args.fetch_delay);
@@ -372,15 +315,25 @@ async fn main() -> Result<()> {
         );
     } else {
         info!(
-            "📋 Standard test timing: immediate start, {}s measurement",
+            "Standard test timing: immediate start, {}s measurement",
             measurement_duration.as_secs()
         );
     }
+}
 
-    // Reset counters before measurement
-    measurer.messages_sent.store(0, Ordering::Relaxed);
-    measurer.bytes_sent.store(0, Ordering::Relaxed);
-    measurer.messages_received.store(0, Ordering::Relaxed);
+/// Run the measurement loop with producers and consumers
+async fn run_measurement(
+    args: &Args,
+    producers: Vec<Producer>,
+    consumers: Vec<Consumer>,
+    measurer: ThroughputMeasurer,
+    total_test_duration: Duration,
+    measurement_duration: Duration,
+    max_backlog: u64,
+    produce_only_target: Option<u64>,
+) {
+    let num_producer_threads = producers.len();
+    let num_consumer_threads = consumers.len();
 
     // Start multiple producer and consumer threads
     let mut producer_handles = Vec::new();
@@ -427,13 +380,14 @@ async fn main() -> Result<()> {
         let measurer = measurer.clone();
         let produce_only = args.produce_only.is_some();
         let bytes_target = produce_only_target;
+        let fetch_delay = args.fetch_delay;
         async move {
             let (min_rate, max_rate, elapsed) = measurer
                 .measure(
                     measurement_duration,
                     "MEASUREMENT",
                     max_backlog,
-                    args.fetch_delay,
+                    fetch_delay,
                     produce_only,
                     bytes_target,
                 )
@@ -474,116 +428,276 @@ async fn main() -> Result<()> {
         let _ = handle.await;
     }
     let _ = measurement_handle.await;
+}
 
-    // Analyze final producer and consumer performance and provide troubleshooting guidance
-    let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
-    let final_received = measurer.messages_received.load(Ordering::Relaxed);
-
+/// Print troubleshooting guidance if needed
+fn print_final_analysis(
+    args: &Args,
+    topic_name: &str,
+    total_partitions: i32,
+    num_consumer_threads: usize,
+    final_sent: u64,
+    final_received: u64,
+) {
     let show_troubleshooting = args.debug_fetch
         || args.debug_produce
         || final_sent == 0
         || (args.produce_only.is_none() && final_received == 0);
 
-    if show_troubleshooting {
-        println!("\n🔍 PERFORMANCE ANALYSIS");
-        println!("================================");
-
-        if final_sent == 0 {
-            println!("❌ CRITICAL: No messages were sent by producers!");
-            println!("\n🔧 PRODUCER TROUBLESHOOTING CHECKLIST:");
-            println!("1. ✅ Broker Connectivity:");
-            println!("   - Verify broker address: {}", args.broker);
-            println!("   - Check network connectivity to broker");
-            println!("   - Ensure broker is running and accepting connections");
-
-            println!("\n2. ✅ Topic & Partition Configuration:");
-            println!(
-                "   - Topic '{}' was created with {} partitions",
-                topic_name, total_partitions
-            );
-            println!("   - Verify topic exists on the target broker");
-            println!("   - Check partition leadership assignments");
-
-            println!("\n3. ✅ Authentication & Authorization:");
-            println!("   - Verify client has WRITE permissions on topic");
-            println!("   - Check ACLs and security settings");
-            println!("   - Ensure authentication credentials are correct");
-
-            println!("\n4. ✅ Re-run with enhanced diagnostics:");
-            println!("   cargo run -- --broker {} --debug-produce", args.broker);
-        } else if final_received == 0 {
-            println!("❌ CRITICAL: No messages were received by consumers!");
-            println!("\n🔧 CONSUMER TROUBLESHOOTING CHECKLIST:");
-            println!("1. ✅ Broker Connectivity:");
-            println!("   - Verify broker address: {}", args.broker);
-            println!("   - Check network connectivity to broker");
-            println!("   - Ensure broker is running and accepting connections");
-
-            println!("\n2. ✅ Topic & Partition Configuration:");
-            println!(
-                "   - Topic '{}' was created with {} partitions",
-                topic_name, total_partitions
-            );
-            println!("   - Verify topic exists on the target broker");
-            println!("   - Check partition leadership and replica assignments");
-
-            println!("\n3. ✅ Authentication & Authorization:");
-            println!("   - Verify client has READ permissions on topic");
-            println!("   - Check ACLs and security settings");
-            println!("   - Ensure authentication credentials are correct");
-
-            println!("\n4. ✅ Protocol Compatibility:");
-            println!("   - Different brokers may use different Kafka versions");
-            println!("   - Check broker logs for protocol errors");
-            println!("   - Verify FETCH request version compatibility");
-
-            println!("\n5. ✅ Re-run with enhanced diagnostics:");
-            println!("   cargo run -- --broker {} --debug-fetch", args.broker);
-            println!("   cargo run -- --broker {} --debug-produce", args.broker);
-        } else if final_received < final_sent {
-            let loss_rate = ((final_sent - final_received) as f64 / final_sent as f64) * 100.0;
-            println!(
-                "⚠️  Message loss detected: {:.1}% ({} sent, {} received)",
-                loss_rate, final_sent, final_received
-            );
-
-            if loss_rate > 5.0 {
-                println!("\n🔧 HIGH LOSS RATE TROUBLESHOOTING:");
-                println!("   - Consumer may be falling behind producer");
-                println!("   - Broker may be dropping messages under load");
-                println!("   - Network issues causing incomplete fetches");
-                println!("   - Consider increasing fetch timeout or reducing producer rate");
-            }
-        } else {
-            println!("✅ Consumer performance looks healthy");
-            println!(
-                "   Messages sent: {}, received: {}",
-                final_sent, final_received
-            );
-        }
-
-        println!("\n📊 Consumer Configuration Used:");
-        println!("   - Consumer threads: {}", num_consumer_threads);
-        println!(
-            "   - Partitions per thread: {}",
-            args.consumer_partitions_per_thread
-        );
-        println!("   - Fetch timeout: 5000ms");
-        println!("   - Max fetch size: 50MB");
-        println!("   - Isolation level: READ_UNCOMMITTED");
+    if !show_troubleshooting {
+        return;
     }
 
-    // Cleanup: delete topic
-    if let Err(e) = admin_client.delete_topic(&topic_name).await {
+    println!("\nPERFORMANCE ANALYSIS");
+    println!("================================");
+
+    if final_sent == 0 {
+        println!("CRITICAL: No messages were sent by producers!");
+        println!("\nPRODUCER TROUBLESHOOTING CHECKLIST:");
+        println!("1. Broker Connectivity:");
+        println!("   - Verify broker address: {}", args.broker);
+        println!("   - Check network connectivity to broker");
+        println!("   - Ensure broker is running and accepting connections");
+
+        println!("\n2. Topic & Partition Configuration:");
+        println!(
+            "   - Topic '{}' was created with {} partitions",
+            topic_name, total_partitions
+        );
+        println!("   - Verify topic exists on the target broker");
+        println!("   - Check partition leadership assignments");
+
+        println!("\n3. Authentication & Authorization:");
+        println!("   - Verify client has WRITE permissions on topic");
+        println!("   - Check ACLs and security settings");
+        println!("   - Ensure authentication credentials are correct");
+
+        println!("\n4. Re-run with enhanced diagnostics:");
+        println!("   cargo run -- --broker {} --debug-produce", args.broker);
+    } else if final_received == 0 && args.produce_only.is_none() {
+        println!("CRITICAL: No messages were received by consumers!");
+        println!("\nCONSUMER TROUBLESHOOTING CHECKLIST:");
+        println!("1. Broker Connectivity:");
+        println!("   - Verify broker address: {}", args.broker);
+        println!("   - Check network connectivity to broker");
+        println!("   - Ensure broker is running and accepting connections");
+
+        println!("\n2. Topic & Partition Configuration:");
+        println!(
+            "   - Topic '{}' was created with {} partitions",
+            topic_name, total_partitions
+        );
+        println!("   - Verify topic exists on the target broker");
+        println!("   - Check partition leadership and replica assignments");
+
+        println!("\n3. Authentication & Authorization:");
+        println!("   - Verify client has READ permissions on topic");
+        println!("   - Check ACLs and security settings");
+        println!("   - Ensure authentication credentials are correct");
+
+        println!("\n4. Protocol Compatibility:");
+        println!("   - Different brokers may use different Kafka versions");
+        println!("   - Check broker logs for protocol errors");
+        println!("   - Verify FETCH request version compatibility");
+
+        println!("\n5. Re-run with enhanced diagnostics:");
+        println!("   cargo run -- --broker {} --debug-fetch", args.broker);
+        println!("   cargo run -- --broker {} --debug-produce", args.broker);
+    } else if final_received < final_sent && args.produce_only.is_none() {
+        let loss_rate = ((final_sent - final_received) as f64 / final_sent as f64) * 100.0;
+        println!(
+            "Message loss detected: {:.1}% ({} sent, {} received)",
+            loss_rate, final_sent, final_received
+        );
+
+        if loss_rate > 5.0 {
+            println!("\nHIGH LOSS RATE TROUBLESHOOTING:");
+            println!("   - Consumer may be falling behind producer");
+            println!("   - Broker may be dropping messages under load");
+            println!("   - Network issues causing incomplete fetches");
+            println!("   - Consider increasing fetch timeout or reducing producer rate");
+        }
+    } else {
+        println!("Consumer performance looks healthy");
+        println!(
+            "   Messages sent: {}, received: {}",
+            final_sent, final_received
+        );
+    }
+
+    println!("\nConsumer Configuration Used:");
+    println!("   - Consumer threads: {}", num_consumer_threads);
+    println!(
+        "   - Partitions per thread: {}",
+        args.consumer_partitions_per_thread
+    );
+    println!("   - Fetch timeout: 5000ms");
+    println!("   - Max fetch size: 50MB");
+    println!("   - Isolation level: READ_UNCOMMITTED");
+}
+
+/// Delete topic and print completion message
+async fn cleanup_topic(admin_client: &KafkaClient, topic_name: &str, profile_report: bool) {
+    if let Err(e) = admin_client.delete_topic(topic_name).await {
         warn!("Failed to delete topic '{}': {}", topic_name, e);
     }
 
     info!("Kitt measurement completed successfully!");
 
     // Generate and display the profiling report if requested
-    if args.profile_report {
+    if profile_report {
         profiling::generate_report();
     }
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+/// Main entry point for the Kafka Integrated Throughput Testing (KITT) tool
+///
+/// This function orchestrates the complete throughput test workflow:
+/// 1. Parse command-line arguments and validate configuration
+/// 2. Establish connection to Kafka broker
+/// 3. Create temporary test topic with specified parameters
+/// 4. Launch producer and consumer threads for parallel processing
+/// 5. Measure and display real-time throughput metrics
+/// 6. Clean up resources and report final results
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    setup_logging();
+
+    // Handle special modes first
+    if args.profile_demo {
+        return run_profile_demo().await;
+    }
+    run_diagnostics_if_enabled(&args);
+
+    // Parse message size and key strategy
+    let message_size = profile!(KittOperation::MessageSizeGeneration, {
+        MessageSize::parse(&args.message_size)?
+    });
+    let key_strategy = KeyStrategy::from_arg(args.random_keys);
+    if let Some(pool_size) = args.random_keys {
+        if pool_size == 0 {
+            info!("Using random keys: generating unique keys on the fly");
+        } else {
+            info!("Using random keys: pool of {} pre-generated keys", pool_size);
+        }
+    }
+
+    // Calculate thread configuration and validate
+    let (num_producer_threads, num_consumer_threads, total_partitions) =
+        calculate_thread_config(&args)?;
+
+    // Print startup information
+    print_startup_info(
+        &args,
+        &message_size,
+        num_producer_threads,
+        num_consumer_threads,
+        total_partitions,
+    );
+
+    // Generate topic name and connect to Kafka
+    let topic_name = generate_topic_name();
+    info!("Test topic: {}", topic_name);
+
+    let admin_client = Arc::new(
+        KafkaClient::connect(&args.broker)
+            .await
+            .map_err(|e| anyhow!("Failed to connect admin client: {}", e))?,
+    );
+    let api_versions = admin_client.api_versions.clone();
+
+    // Create topic and wait for it to be ready
+    admin_client
+        .create_topic(&topic_name, total_partitions, 1)
+        .await
+        .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
+    info!("Waiting for topic to be ready...");
+    sleep(Duration::from_secs(3)).await;
+
+    // Log connection creation progress
+    if args.produce_only.is_some() {
+        info!(
+            "Creating {} producer connections (produce-only mode)...",
+            num_producer_threads
+        );
+    } else {
+        info!(
+            "Creating {} producer and {} consumer connections...",
+            num_producer_threads, num_consumer_threads
+        );
+    }
+
+    // Create producers and consumers
+    let producers = create_producers(
+        &args,
+        &topic_name,
+        total_partitions,
+        num_producer_threads,
+        message_size,
+        key_strategy,
+        &api_versions,
+    )
+    .await?;
+
+    let consumers =
+        create_consumers(&args, &topic_name, num_consumer_threads, &api_versions).await?;
+    info!("All client connections established successfully");
+
+    // Parse produce-only data target if specified
+    let produce_only_target: Option<u64> = if let Some(ref target_str) = args.produce_only {
+        if target_str.is_empty() {
+            None // --produce-only without value: time-based
+        } else {
+            Some(parse_bytes(target_str)?) // --produce-only 1GB: data-target based
+        }
+    } else {
+        None
+    };
+
+    // Calculate backlog and timing configuration
+    let max_backlog = calculate_max_backlog(&args, produce_only_target);
+    let measurement_duration = Duration::from_secs(args.duration_secs);
+    let total_test_duration = measurement_duration + Duration::from_secs(args.fetch_delay);
+    log_test_timing(&args, measurement_duration, total_test_duration);
+
+    // Initialize measurer and reset counters
+    let measurer = ThroughputMeasurer::with_leds(LED_BAR_WIDTH, !args.silent);
+    measurer.messages_sent.store(0, Ordering::Relaxed);
+    measurer.bytes_sent.store(0, Ordering::Relaxed);
+    measurer.messages_received.store(0, Ordering::Relaxed);
+
+    // Run the measurement
+    run_measurement(
+        &args,
+        producers,
+        consumers,
+        measurer.clone(),
+        total_test_duration,
+        measurement_duration,
+        max_backlog,
+        produce_only_target,
+    )
+    .await;
+
+    // Analyze results and provide troubleshooting guidance
+    let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
+    let final_received = measurer.messages_received.load(Ordering::Relaxed);
+    print_final_analysis(
+        &args,
+        &topic_name,
+        total_partitions,
+        num_consumer_threads,
+        final_sent,
+        final_received,
+    );
+
+    // Cleanup and finish
+    cleanup_topic(&admin_client, &topic_name, args.profile_report).await;
 
     Ok(())
 }
@@ -594,7 +708,7 @@ async fn run_profile_demo() -> Result<()> {
     use std::time::Duration;
     use tokio::time::sleep;
 
-    println!("🚀 KITT Profiling Demonstration");
+    println!("KITT Profiling Demonstration");
     println!("================================\n");
     println!("Simulating various operations to show profiling capabilities...");
     println!("Note: Message validation is disabled by default for better performance.");
@@ -603,7 +717,7 @@ async fn run_profile_demo() -> Result<()> {
     // Simulate message production and consumption operations
 
     // Simulate producer operations
-    println!("📤 Simulating Producer Operations...");
+    println!("Simulating Producer Operations...");
     for batch in 0..5 {
         for _msg in 0..100 {
             profile!(KittOperation::MessageProduce, {
@@ -633,10 +747,10 @@ async fn run_profile_demo() -> Result<()> {
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
         }
     }
-    println!(" ✓");
+    println!(" Done");
 
     // Simulate consumer operations
-    println!("📥 Simulating Consumer Operations...");
+    println!("Simulating Consumer Operations...");
     for fetch in 0..8 {
         profile!(KittOperation::MessageConsume, {
             sleep(Duration::from_millis(30)).await;
@@ -652,17 +766,17 @@ async fn run_profile_demo() -> Result<()> {
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
         }
     }
-    println!(" ✓");
+    println!(" Done");
 
     // Simulate additional message size generation for variety
-    println!("⚙️  Simulating Additional Processing...");
+    println!("Simulating Additional Processing...");
     for _i in 0..50 {
         profile!(KittOperation::MessageSizeGeneration, {
             sleep(Duration::from_micros(20)).await;
         });
     }
 
-    println!("✓ Simulation complete!\n");
+    println!("Simulation complete!\n");
 
     // Always generate the profiling report in demo mode
     profiling::generate_report();
