@@ -23,7 +23,7 @@ use kafka_protocol::{
 };
 use kitt_throbbler::KnightRiderAnimator;
 use rand::seq::SliceRandom;
-use rand::{thread_rng, Rng};
+use rand::thread_rng;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -83,199 +83,15 @@ pub const LED_MOVEMENT_SPEED: usize = 2;
 /// Ensure LED_MOVEMENT_SPEED is reasonable relative to this width.
 pub const LED_BAR_WIDTH: usize = 25;
 
+mod args;
 mod kafka_client;
 pub mod profiling;
 mod utils;
+use args::{Args, KeyStrategy, MessageSize};
 use kafka_client::KafkaClient;
 use profiling::KittOperation;
 use quantum_pulse::profile;
 use utils::{format_bytes, lcm, parse_bytes, verify_record_batch_crc};
-
-/// Command-line arguments for configuring the throughput test
-#[derive(Parser)]
-#[command(name = "kitt")]
-#[command(about = "Kafka throughput measurement tool")]
-struct Args {
-    /// Kafka broker address
-    #[arg(short, long, default_value = "localhost:9092")]
-    broker: String,
-
-    /// Number of partitions assigned to each producer thread
-    #[arg(short, long, default_value = "1")]
-    producer_partitions_per_thread: i32,
-
-    /// Number of partitions assigned to each consumer thread
-    #[arg(short, long, default_value = "1")]
-    consumer_partitions_per_thread: i32,
-
-    /// Number of producer threads
-    #[arg(long, default_value = "4")]
-    producer_threads: i32,
-
-    /// Number of consumer threads
-    #[arg(long, default_value = "4")]
-    consumer_threads: i32,
-
-    /// Use sticky producer-partition assignment with LCM-based partition calculation (legacy mode)
-    #[arg(long, default_value = "false")]
-    sticky: bool,
-
-    /// Number of producer/consumer threads (only used with --sticky mode)
-    #[arg(short, long)]
-    threads: Option<i32>,
-
-    /// Message size in bytes (e.g., "1024") or range (e.g., "100-1000")
-    #[arg(short, long, default_value = "1024")]
-    message_size: String,
-
-    /// Measurement duration in seconds
-    #[arg(short, long, default_value = "15")]
-    duration_secs: u64,
-
-    /// Enable detailed FETCH response diagnostics for troubleshooting
-    #[arg(long, default_value = "false")]
-    debug_fetch: bool,
-
-    /// Enable detailed PRODUCE response diagnostics for troubleshooting
-    #[arg(long, default_value = "false")]
-    debug_produce: bool,
-
-    /// Initial delay in seconds before consumers start fetching (helps test backlog handling)
-    #[arg(long, default_value = "0")]
-    fetch_delay: u64,
-
-    /// Run a profiling demonstration without connecting to Kafka
-    #[arg(long, default_value = "false")]
-    profile_demo: bool,
-
-    /// Enable message validation for produce/consume responses (disabled by default for better performance)
-    #[arg(long, default_value = "false")]
-    message_validation: bool,
-
-    /// Generate and display profiling report at the end (disabled by default)
-    #[arg(long, default_value = "false")]
-    profile_report: bool,
-
-    /// Disable audio playback during animation
-    #[arg(long, default_value = "false")]
-    silent: bool,
-
-    /// Generate random keys for messages. If a value is provided, creates a pool of that size
-    /// to pick keys from. If no value is provided, generates unique random keys on the fly.
-    #[arg(long, num_args = 0..=1, default_missing_value = "0")]
-    random_keys: Option<usize>,
-
-    /// Number of messages to include in each record batch (default: 1)
-    #[arg(long, default_value = "1")]
-    messages_per_batch: usize,
-
-    /// Simulated processing time per record in milliseconds (default: 0 = no delay)
-    #[arg(long, default_value = "0")]
-    record_processing_time: u64,
-
-    /// Produce-only mode: skip consumers and backpressure to measure pure producer throughput.
-    /// Optionally specify a data target (e.g., "1GB", "500MB") to run until that amount is sent.
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
-    produce_only: Option<String>,
-}
-
-/// Represents the size configuration for test messages
-/// Supports both fixed-size messages and variable-size ranges
-#[derive(Debug, Clone)]
-enum MessageSize {
-    /// Fixed message size in bytes
-    Fixed(usize),
-    /// Variable message size with min and max bounds (inclusive)
-    Range(usize, usize),
-}
-
-impl MessageSize {
-    /// Parses a message size specification from a string
-    ///
-    /// # Arguments
-    /// * `s` - Size specification, either "1024" for fixed size or "100-1000" for range
-    ///
-    /// # Returns
-    /// * `Ok(MessageSize)` - Parsed message size configuration
-    /// * `Err(anyhow::Error)` - If the string format is invalid
-    fn parse(s: &str) -> Result<Self> {
-        if let Some((min_str, max_str)) = s.split_once('-') {
-            let min = min_str.parse::<usize>()?;
-            let max = max_str.parse::<usize>()?;
-            if min > max {
-                return Err(anyhow!("Invalid range: min {} > max {}", min, max));
-            }
-            Ok(MessageSize::Range(min, max))
-        } else {
-            let size = s.parse::<usize>()?;
-            Ok(MessageSize::Fixed(size))
-        }
-    }
-
-    /// Generates a message size based on the configuration
-    ///
-    /// # Returns
-    /// * For `Fixed`: Returns the fixed size
-    /// * For `Range`: Returns a random size within the specified range (inclusive)
-    fn generate_size(&self) -> usize {
-        match self {
-            MessageSize::Fixed(size) => *size,
-            MessageSize::Range(min, max) => thread_rng().gen_range(*min..=*max),
-        }
-    }
-
-}
-
-/// Strategy for generating message keys
-///
-/// Kafka message keys determine partition assignment and enable log compaction.
-/// This enum allows testing different key generation strategies.
-#[derive(Debug, Clone)]
-enum KeyStrategy {
-    /// No keys - messages have null keys (default Kafka behavior)
-    NoKeys,
-    /// Generate unique random keys on the fly for each message
-    RandomOnTheFly,
-    /// Pick keys randomly from a pre-generated pool of the specified size
-    RandomPool(Arc<Vec<Bytes>>),
-}
-
-impl KeyStrategy {
-    /// Creates a KeyStrategy from the command-line argument value
-    ///
-    /// # Arguments
-    /// * `pool_size` - None for no keys, Some(0) for on-the-fly generation,
-    ///   Some(n) for a pool of n pre-generated keys
-    fn from_arg(pool_size: Option<usize>) -> Self {
-        match pool_size {
-            None => KeyStrategy::NoKeys,
-            Some(0) => KeyStrategy::RandomOnTheFly,
-            Some(size) => {
-                // Pre-generate a pool of random keys
-                let keys: Vec<Bytes> = (0..size)
-                    .map(|_| Bytes::from(uuid::Uuid::new_v4().to_string()))
-                    .collect();
-                KeyStrategy::RandomPool(Arc::new(keys))
-            }
-        }
-    }
-
-    /// Generates a key based on the configured strategy
-    ///
-    /// # Returns
-    /// * `None` - For NoKeys strategy
-    /// * `Some(Bytes)` - A random key for other strategies
-    fn generate_key(&self) -> Option<Bytes> {
-        match self {
-            KeyStrategy::NoKeys => None,
-            KeyStrategy::RandomOnTheFly => Some(Bytes::from(uuid::Uuid::new_v4().to_string())),
-            KeyStrategy::RandomPool(pool) => {
-                let key = pool.choose(&mut thread_rng()).expect("pool should not be empty");
-                Some(key.clone())
-            }
-        }
-    }
-}
 
 /// Kafka message producer that sends messages to a specific topic
 /// Each producer instance runs in its own thread and targets specific partitions
