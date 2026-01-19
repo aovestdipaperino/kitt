@@ -1,3 +1,8 @@
+//! Profiling infrastructure for KITT performance measurement.
+//!
+//! This module provides operation definitions and report generation for
+//! tracking performance metrics across all KITT operations.
+
 use quantum_pulse::{ProfileCollector, ProfileOp};
 use std::collections::HashMap;
 

@@ -1,7 +1,7 @@
-/// Thread assignment utilities for the KITT application
-///
-/// This module provides utilities for calculating thread assignments
-/// based on the threads-per-partition model.
+//! Thread assignment utilities for the KITT application.
+//!
+//! This module provides utilities for calculating thread assignments
+//! based on the threads-per-partition model.
 
 /// Calculates thread assignment details for a given thread ID and configuration
 ///

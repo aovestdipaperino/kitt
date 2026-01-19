@@ -1,3 +1,8 @@
+//! Real-time throughput measurement with Knight Rider animation.
+//!
+//! This module provides the `ThroughputMeasurer` struct for tracking and displaying
+//! message production/consumption rates with visual feedback during tests.
+
 use crate::utils::format_bytes;
 use kitt_throbbler::KnightRiderAnimator;
 use std::sync::atomic::{AtomicU64, Ordering};

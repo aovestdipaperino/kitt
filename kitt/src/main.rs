@@ -3,6 +3,11 @@
 //! This tool measures Kafka producer and consumer throughput by creating a temporary topic,
 //! producing messages at high rates, and measuring the end-to-end latency and throughput.
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use anyhow::{anyhow, Result};
 use clap::Parser;
 
