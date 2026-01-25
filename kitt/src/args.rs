@@ -96,6 +96,10 @@ pub struct Args {
     /// Optionally specify a data target (e.g., "1GB", "500MB") to run until that amount is sent.
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     pub produce_only: Option<String>,
+
+    /// Quiet mode: suppress all UI output and print machine-readable results
+    #[arg(short, long, default_value = "false")]
+    pub quiet: bool,
 }
 
 /// Represents the size configuration for test messages

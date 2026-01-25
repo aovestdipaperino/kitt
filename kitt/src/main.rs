@@ -51,11 +51,12 @@ use utils::{format_bytes, lcm, parse_bytes};
 // ============================================================================
 
 /// Initialize tracing subscriber for structured logging
-fn setup_logging() {
+fn setup_logging(quiet: bool) {
+    let default_level = if quiet { "error" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::filter::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new(default_level))
                 .add_directive("symphonia_core=warn".parse().unwrap())
                 .add_directive("symphonia_bundle_mp3=warn".parse().unwrap()),
         )
@@ -147,6 +148,10 @@ fn print_startup_info(
     num_consumer_threads: usize,
     total_partitions: i32,
 ) {
+    if args.quiet {
+        return;
+    }
+
     println!("{}", include_str!("logo.txt"));
 
     info!("Starting Kitt - Kafka Implementation Throughput Tool");
@@ -352,6 +357,8 @@ struct MeasurementConfig {
     produce_only_target: Option<u64>,
     /// Fetch delay before starting consumers
     fetch_delay: u64,
+    /// Quiet mode - suppress UI and print machine-readable output
+    quiet: bool,
 }
 
 /// Run the measurement loop with producers and consumers
@@ -369,6 +376,7 @@ async fn run_measurement(
         max_backlog,
         produce_only_target,
         fetch_delay,
+        quiet,
     } = config;
 
     // Spawn producers and consumers as separate tokio tasks for true parallelism.
@@ -412,40 +420,80 @@ async fn run_measurement(
     let measurement_handle = tokio::spawn({
         let measurer = measurer.clone();
         async move {
-            let (min_rate, max_rate, elapsed) = measurer
-                .measure(
-                    measurement_duration,
-                    "MEASUREMENT",
-                    max_backlog,
-                    fetch_delay,
-                    produce_only,
-                    produce_only_target,
-                )
-                .await;
+            let (min_rate, max_rate, elapsed) = if quiet {
+                measurer
+                    .measure_quiet(
+                        measurement_duration,
+                        max_backlog,
+                        fetch_delay,
+                        produce_only,
+                        produce_only_target,
+                    )
+                    .await
+            } else {
+                measurer
+                    .measure(
+                        measurement_duration,
+                        "MEASUREMENT",
+                        max_backlog,
+                        fetch_delay,
+                        produce_only,
+                        produce_only_target,
+                    )
+                    .await
+            };
 
             let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
             let final_received = measurer.messages_received.load(Ordering::Relaxed);
             let total_data_sent = measurer.bytes_sent.load(Ordering::Relaxed);
 
-            info!("=== FINAL RESULTS ===");
-            if produce_only {
-                let throughput = final_sent as f64 / elapsed.as_secs_f64();
-                info!(
-                    "Messages sent: {}, Data sent: {}, Producer throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s)",
-                    final_sent, format_bytes(total_data_sent), throughput, min_rate, max_rate
-                );
-            } else {
-                let throughput = final_received as f64 / elapsed.as_secs_f64();
-                let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
-                let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
-                let avg_backlog = if backlog_count > 0 {
-                    backlog_sum / backlog_count
+            if quiet {
+                // Machine-readable output: space-separated key=value pairs
+                let throughput = if produce_only {
+                    final_sent as f64 / elapsed.as_secs_f64()
                 } else {
-                    0
+                    final_received as f64 / elapsed.as_secs_f64()
                 };
-                info!("Messages sent: {}, Data sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, avg backlog: {}%)",
-                    final_sent, format_bytes(total_data_sent), final_received, throughput, min_rate, max_rate, avg_backlog
-                );
+
+                if produce_only {
+                    println!(
+                        "messages_sent={} bytes_sent={} throughput_msg_per_sec={:.1} min_rate={:.1} max_rate={:.1}",
+                        final_sent, total_data_sent, throughput, min_rate, max_rate
+                    );
+                } else {
+                    let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
+                    let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
+                    let avg_backlog = if backlog_count > 0 {
+                        backlog_sum / backlog_count
+                    } else {
+                        0
+                    };
+                    println!(
+                        "messages_sent={} bytes_sent={} messages_received={} throughput_msg_per_sec={:.1} min_rate={:.1} max_rate={:.1} avg_backlog_pct={}",
+                        final_sent, total_data_sent, final_received, throughput, min_rate, max_rate, avg_backlog
+                    );
+                }
+            } else {
+                info!("=== FINAL RESULTS ===");
+                if produce_only {
+                    let throughput = final_sent as f64 / elapsed.as_secs_f64();
+                    info!(
+                        "Messages sent: {}, Data sent: {}, Producer throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s)",
+                        final_sent, format_bytes(total_data_sent), throughput, min_rate, max_rate
+                    );
+                } else {
+                    let throughput = final_received as f64 / elapsed.as_secs_f64();
+                    let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
+                    let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
+                    let avg_backlog = if backlog_count > 0 {
+                        backlog_sum / backlog_count
+                    } else {
+                        0
+                    };
+                    info!("Messages sent: {}, Data sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, avg backlog: {}%)",
+                        final_sent, format_bytes(total_data_sent), final_received, throughput, min_rate, max_rate, avg_backlog
+                    );
+                }
             }
         }
     });
@@ -568,15 +616,19 @@ fn print_final_analysis(
 }
 
 /// Delete topic and print completion message
-async fn cleanup_topic(admin_client: &KafkaClient, topic_name: &str, profile_report: bool) {
+async fn cleanup_topic(admin_client: &KafkaClient, topic_name: &str, profile_report: bool, quiet: bool) {
     if let Err(e) = admin_client.delete_topic(topic_name).await {
-        warn!("Failed to delete topic '{}': {}", topic_name, e);
+        if !quiet {
+            warn!("Failed to delete topic '{}': {}", topic_name, e);
+        }
     }
 
-    info!("Kitt measurement completed successfully!");
+    if !quiet {
+        info!("Kitt measurement completed successfully!");
+    }
 
-    // Generate and display the profiling report if requested
-    if profile_report {
+    // Generate and display the profiling report if requested (skip in quiet mode)
+    if profile_report && !quiet {
         profiling::generate_report();
     }
 }
@@ -597,7 +649,7 @@ async fn cleanup_topic(admin_client: &KafkaClient, topic_name: &str, profile_rep
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    setup_logging();
+    setup_logging(args.quiet);
 
     // Handle special modes first
     if args.profile_demo {
@@ -698,8 +750,8 @@ async fn main() -> Result<()> {
     let total_test_duration = measurement_duration + Duration::from_secs(args.fetch_delay);
     log_test_timing(&args, measurement_duration, total_test_duration);
 
-    // Initialize measurer and reset counters
-    let measurer = ThroughputMeasurer::with_leds(LED_BAR_WIDTH, !args.silent);
+    // Initialize measurer and reset counters (disable audio in quiet or silent mode)
+    let measurer = ThroughputMeasurer::with_leds(LED_BAR_WIDTH, !args.silent && !args.quiet);
     measurer.messages_sent.store(0, Ordering::Relaxed);
     measurer.bytes_sent.store(0, Ordering::Relaxed);
     measurer.messages_received.store(0, Ordering::Relaxed);
@@ -714,6 +766,7 @@ async fn main() -> Result<()> {
             max_backlog,
             produce_only_target,
             fetch_delay: args.fetch_delay,
+            quiet: args.quiet,
         },
         producers,
         consumers,
@@ -721,20 +774,22 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    // Analyze results and provide troubleshooting guidance
-    let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
-    let final_received = measurer.messages_received.load(Ordering::Relaxed);
-    print_final_analysis(
-        &args,
-        &topic_name,
-        total_partitions,
-        num_consumer_threads,
-        final_sent,
-        final_received,
-    );
+    // Analyze results and provide troubleshooting guidance (skip in quiet mode)
+    if !args.quiet {
+        let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
+        let final_received = measurer.messages_received.load(Ordering::Relaxed);
+        print_final_analysis(
+            &args,
+            &topic_name,
+            total_partitions,
+            num_consumer_threads,
+            final_sent,
+            final_received,
+        );
+    }
 
     // Cleanup and finish
-    cleanup_topic(&admin_client, &topic_name, args.profile_report).await;
+    cleanup_topic(&admin_client, &topic_name, args.profile_report, args.quiet).await;
 
     Ok(())
 }

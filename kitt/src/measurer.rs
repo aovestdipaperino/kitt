@@ -82,6 +82,104 @@ impl ThroughputMeasurer {
         }
     }
 
+    /// Measures throughput over a specified duration without any visual output (quiet mode)
+    ///
+    /// This method collects the same metrics as `measure()` but suppresses all UI output.
+    /// Used with `--quiet` flag for machine-readable output.
+    ///
+    /// # Arguments
+    /// * `duration` - How long to measure throughput
+    /// * `max_backlog` - Maximum backlog threshold for percentage calculation
+    /// * `fetch_delay` - Initial delay before starting measurement
+    /// * `produce_only` - Whether in produce-only mode (track sent vs received)
+    /// * `bytes_target` - Optional data target for produce-only mode
+    ///
+    /// # Returns
+    /// * `(min_rate, max_rate, elapsed)` - Tuple containing minimum/maximum rates and actual elapsed time
+    pub async fn measure_quiet(
+        &self,
+        duration: Duration,
+        max_backlog: u64,
+        fetch_delay: u64,
+        produce_only: bool,
+        bytes_target: Option<u64>,
+    ) -> (f64, f64, Duration) {
+        // Wait for fetch delay before starting measurement
+        if fetch_delay > 0 {
+            tokio::time::sleep(Duration::from_secs(fetch_delay)).await;
+        }
+        let start_time = Instant::now();
+        let end_time = start_time + duration;
+
+        // 500ms rate interval for measurement
+        let mut rate_interval = interval(Duration::from_millis(500));
+
+        // Baseline counters for rate calculation
+        let start_count = if produce_only {
+            self.messages_sent.load(Ordering::Relaxed)
+        } else {
+            self.messages_received.load(Ordering::Relaxed)
+        };
+        let mut last_count = start_count;
+        let mut last_rate_time = start_time;
+
+        // Rate tracking
+        let mut min_rate = f64::MAX;
+        let mut max_rate = 0.0f64;
+
+        while bytes_target.is_some() || Instant::now() < end_time {
+            // Check if bytes target reached
+            if let Some(target) = bytes_target {
+                if self.bytes_sent.load(Ordering::Relaxed) >= target {
+                    break;
+                }
+            }
+
+            rate_interval.tick().await;
+
+            // Calculate instantaneous rate
+            let now = Instant::now();
+            let current_count = if produce_only {
+                self.messages_sent.load(Ordering::Relaxed)
+            } else {
+                self.messages_received.load(Ordering::Relaxed)
+            };
+            let time_elapsed = now.duration_since(last_rate_time).as_secs_f64();
+
+            if time_elapsed > 0.0 {
+                let current_rate = (current_count - last_count) as f64 / time_elapsed;
+
+                // Skip zero rates to avoid skewing min
+                if current_rate > 0.0 {
+                    if min_rate == f64::MAX {
+                        min_rate = current_rate;
+                    } else {
+                        min_rate = min_rate.min(current_rate);
+                    }
+                    max_rate = max_rate.max(current_rate);
+                }
+
+                // Track backlog percentage (for final average calculation)
+                if !produce_only {
+                    let current_sent = self.messages_sent.load(Ordering::Relaxed);
+                    let current_received = self.messages_received.load(Ordering::Relaxed);
+                    let backlog = current_sent.saturating_sub(current_received);
+                    let backlog_percentage =
+                        (backlog as f64 / max_backlog as f64 * 100.0).min(100.0) as u64;
+                    self.backlog_percentage_sum
+                        .fetch_add(backlog_percentage, Ordering::Relaxed);
+                    self.backlog_measurement_count.fetch_add(1, Ordering::Relaxed);
+                }
+
+                last_count = current_count;
+                last_rate_time = now;
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+        (min_rate, max_rate, elapsed)
+    }
+
     /// Measures throughput over a specified duration with real-time visual feedback
     ///
     /// This method runs two concurrent timers:
