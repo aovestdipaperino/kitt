@@ -36,6 +36,7 @@ mod kafka_client;
 mod measurer;
 mod producer;
 pub mod profiling;
+mod ui;
 mod utils;
 use args::{Args, KeyStrategy, MessageSize};
 use consumer::Consumer;
