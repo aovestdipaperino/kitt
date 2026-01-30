@@ -13,6 +13,8 @@ use kafka_protocol::{
         create_topics_request::{CreatableTopic, CreateTopicsRequest},
         delete_topics_request::DeleteTopicsRequest,
         delete_topics_response::DeleteTopicsResponse,
+        metadata_request::{MetadataRequest, MetadataRequestTopic},
+        metadata_response::MetadataResponse,
         ApiKey, RequestHeader, ResponseHeader, TopicName,
     },
     protocol::{Decodable, Encodable, StrBytes},
@@ -52,6 +54,13 @@ pub struct KafkaClient {
     /// Maps API key (i16) to (min_version, max_version) tuple
     /// Used to select compatible protocol versions for requests
     pub api_versions: HashMap<i16, (i16, i16)>, // (min_version, max_version)
+}
+
+/// Metadata about an existing Kafka topic
+#[derive(Debug, Clone)]
+pub struct TopicMetadata {
+    /// Number of partitions in the topic
+    pub partition_count: i32,
 }
 
 impl KafkaClient {
@@ -552,6 +561,61 @@ impl KafkaClient {
             topic,
             response_count
         ))
+    }
+
+    /// Gets metadata for an existing topic
+    ///
+    /// Returns topic metadata including partition count. Fails if topic doesn't exist.
+    ///
+    /// # Arguments
+    /// * `topic` - Name of the topic to query
+    ///
+    /// # Returns
+    /// * `Ok(TopicMetadata)` - Topic metadata if topic exists
+    /// * `Err(anyhow::Error)` - If topic doesn't exist or query fails
+    pub async fn get_topic_metadata(&self, topic: &str) -> Result<TopicMetadata> {
+        debug!("Getting metadata for topic '{}'", topic);
+
+        let mut request = MetadataRequest::default();
+
+        let mut topic_request = MetadataRequestTopic::default();
+        topic_request.name = Some(TopicName(StrBytes::from_string(topic.to_string())));
+        request.topics = Some(vec![topic_request]);
+
+        let version = self.get_supported_version(ApiKey::Metadata, 1);
+        let response_bytes = self
+            .send_request(ApiKey::Metadata, &request, version)
+            .await
+            .map_err(|e| anyhow!("Failed to get metadata for topic '{}': {}", topic, e))?;
+
+        let mut cursor = std::io::Cursor::new(response_bytes.as_ref());
+        let response_header_version = ApiKey::Metadata.response_header_version(version);
+        let _response_header = ResponseHeader::decode(&mut cursor, response_header_version)
+            .map_err(|e| anyhow!("Failed to decode metadata response header: {}", e))?;
+
+        let response = MetadataResponse::decode(&mut cursor, version)
+            .map_err(|e| anyhow!("Failed to decode metadata response: {}", e))?;
+
+        // Find our topic in the response
+        for topic_metadata in response.topics {
+            let topic_name = topic_metadata.name.as_ref().map(|n| n.0.as_str()).unwrap_or("");
+            if topic_name == topic {
+                // Check for errors
+                if topic_metadata.error_code != 0 {
+                    let error_msg = match topic_metadata.error_code {
+                        3 => "Unknown topic or partition".to_string(),
+                        _ => format!("Kafka error code: {}", topic_metadata.error_code),
+                    };
+                    return Err(anyhow!("Topic '{}' not found: {}", topic, error_msg));
+                }
+
+                let partition_count = topic_metadata.partitions.len() as i32;
+                debug!("Topic '{}' has {} partitions", topic, partition_count);
+                return Ok(TopicMetadata { partition_count });
+            }
+        }
+
+        Err(anyhow!("Topic '{}' not found in metadata response", topic))
     }
 }
 
