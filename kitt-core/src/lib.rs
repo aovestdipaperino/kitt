@@ -8,6 +8,7 @@ pub mod config;
 pub mod consumer;
 pub mod events;
 pub mod producer;
+pub mod runner;
 pub mod utils;
 
 // Re-export public API
@@ -16,3 +17,4 @@ pub use config::{KeyStrategy, MessageSize, ProduceOnlyMode, TestConfig, TestConf
 pub use consumer::Consumer;
 pub use events::{TestEvent, TestPhase, TestResults};
 pub use producer::Producer;
+pub use runner::{run_test, TestHandle};
