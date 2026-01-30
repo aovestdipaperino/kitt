@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod events;
+pub mod utils;
 
 // Re-export public API
 pub use config::{KeyStrategy, MessageSize, ProduceOnlyMode, TestConfig, TestConfigBuilder};
