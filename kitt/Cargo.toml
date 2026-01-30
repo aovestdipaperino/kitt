@@ -33,5 +33,6 @@ chrono = "0.4.38"
 futures = "0.3"
 indexmap = "2.0.0"
 kitt_throbbler = { path = "../kitt_throbbler" }
+kitt-core = { path = "../kitt-core" }
 quantum-pulse = { version = "0.1.6", features = ["full"] }
 mimalloc = "0.1"

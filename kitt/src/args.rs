@@ -1,14 +1,12 @@
 //! Command-line argument types for KITT
 //!
-//! This module contains CLI argument parsing types including the main Args struct
-//! and supporting enums for message size and key generation strategies.
+//! This module contains CLI argument parsing types including the main Args struct.
+//! The MessageSize and KeyStrategy types are re-exported from kitt-core.
 
-use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use clap::Parser;
-use rand::seq::SliceRandom;
-use rand::{thread_rng, Rng};
-use std::sync::Arc;
+
+// Re-export types from kitt-core for use by main.rs
+pub use kitt_core::{KeyStrategy, MessageSize};
 
 /// Command-line arguments for configuring the throughput test
 #[derive(Parser)]
@@ -102,102 +100,6 @@ pub struct Args {
     pub quiet: bool,
 }
 
-/// Represents the size configuration for test messages
-/// Supports both fixed-size messages and variable-size ranges
-#[derive(Debug, Clone)]
-pub enum MessageSize {
-    /// Fixed message size in bytes
-    Fixed(usize),
-    /// Variable message size with min and max bounds (inclusive)
-    Range(usize, usize),
-}
-
-impl MessageSize {
-    /// Parses a message size specification from a string
-    ///
-    /// # Arguments
-    /// * `s` - Size specification, either "1024" for fixed size or "100-1000" for range
-    ///
-    /// # Returns
-    /// * `Ok(MessageSize)` - Parsed message size configuration
-    /// * `Err(anyhow::Error)` - If the string format is invalid
-    pub fn parse(s: &str) -> Result<Self> {
-        if let Some((min_str, max_str)) = s.split_once('-') {
-            let min = min_str.parse::<usize>()?;
-            let max = max_str.parse::<usize>()?;
-            if min > max {
-                return Err(anyhow!("Invalid range: min {} > max {}", min, max));
-            }
-            Ok(MessageSize::Range(min, max))
-        } else {
-            let size = s.parse::<usize>()?;
-            Ok(MessageSize::Fixed(size))
-        }
-    }
-
-    /// Generates a message size based on the configuration
-    ///
-    /// # Returns
-    /// * For `Fixed`: Returns the fixed size
-    /// * For `Range`: Returns a random size within the specified range (inclusive)
-    pub fn generate_size(&self) -> usize {
-        match self {
-            MessageSize::Fixed(size) => *size,
-            MessageSize::Range(min, max) => thread_rng().gen_range(*min..=*max),
-        }
-    }
-}
-
-/// Strategy for generating message keys
-///
-/// Kafka message keys determine partition assignment and enable log compaction.
-/// This enum allows testing different key generation strategies.
-#[derive(Debug, Clone)]
-pub enum KeyStrategy {
-    /// No keys - messages have null keys (default Kafka behavior)
-    NoKeys,
-    /// Generate unique random keys on the fly for each message
-    RandomOnTheFly,
-    /// Pick keys randomly from a pre-generated pool of the specified size
-    RandomPool(Arc<Vec<Bytes>>),
-}
-
-impl KeyStrategy {
-    /// Creates a KeyStrategy from the command-line argument value
-    ///
-    /// # Arguments
-    /// * `pool_size` - None for no keys, Some(0) for on-the-fly generation,
-    ///   Some(n) for a pool of n pre-generated keys
-    pub fn from_arg(pool_size: Option<usize>) -> Self {
-        match pool_size {
-            None => KeyStrategy::NoKeys,
-            Some(0) => KeyStrategy::RandomOnTheFly,
-            Some(size) => {
-                // Pre-generate a pool of random keys
-                let keys: Vec<Bytes> = (0..size)
-                    .map(|_| Bytes::from(uuid::Uuid::new_v4().to_string()))
-                    .collect();
-                KeyStrategy::RandomPool(Arc::new(keys))
-            }
-        }
-    }
-
-    /// Generates a key based on the configured strategy
-    ///
-    /// # Returns
-    /// * `None` - For NoKeys strategy
-    /// * `Some(Bytes)` - A random key for other strategies
-    pub fn generate_key(&self) -> Option<Bytes> {
-        match self {
-            KeyStrategy::NoKeys => None,
-            KeyStrategy::RandomOnTheFly => Some(Bytes::from(uuid::Uuid::new_v4().to_string())),
-            KeyStrategy::RandomPool(pool) => {
-                let key = pool.choose(&mut thread_rng()).expect("pool should not be empty");
-                Some(key.clone())
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -254,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_key_strategy_no_keys() {
-        let strategy = KeyStrategy::from_arg(None);
+        let strategy = KeyStrategy::from_pool_size(None);
         match strategy {
             KeyStrategy::NoKeys => {}
             _ => panic!("Expected NoKeys variant"),
@@ -264,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_key_strategy_random_on_the_fly() {
-        let strategy = KeyStrategy::from_arg(Some(0));
+        let strategy = KeyStrategy::from_pool_size(Some(0));
         match strategy {
             KeyStrategy::RandomOnTheFly => {}
             _ => panic!("Expected RandomOnTheFly variant"),
@@ -279,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_key_strategy_random_pool() {
-        let strategy = KeyStrategy::from_arg(Some(10));
+        let strategy = KeyStrategy::from_pool_size(Some(10));
         match &strategy {
             KeyStrategy::RandomPool(pool) => {
                 assert_eq!(pool.len(), 10);

@@ -748,6 +748,7 @@ dependencies = [
  "futures",
  "indexmap",
  "kafka-protocol",
+ "kitt-core",
  "kitt_throbbler",
  "mimalloc",
  "quantum-pulse",

@@ -661,7 +661,7 @@ async fn main() -> Result<()> {
     let message_size = profile!(KittOperation::MessageSizeGeneration, {
         MessageSize::parse(&args.message_size)?
     });
-    let key_strategy = KeyStrategy::from_arg(args.random_keys);
+    let key_strategy = KeyStrategy::from_pool_size(args.random_keys);
     if let Some(pool_size) = args.random_keys {
         if pool_size == 0 {
             info!("Using random keys: generating unique keys on the fly");
