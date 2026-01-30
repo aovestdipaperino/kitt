@@ -616,10 +616,12 @@ fn print_final_analysis(
 }
 
 /// Delete topic and print completion message
-async fn cleanup_topic(admin_client: &KafkaClient, topic_name: &str, profile_report: bool, quiet: bool) {
-    if let Err(e) = admin_client.delete_topic(topic_name).await {
-        if !quiet {
-            warn!("Failed to delete topic '{}': {}", topic_name, e);
+async fn cleanup_topic(admin_client: &KafkaClient, topic_name: &str, profile_report: bool, quiet: bool, use_existing_topic: bool) {
+    if !use_existing_topic {
+        if let Err(e) = admin_client.delete_topic(topic_name).await {
+            if !quiet {
+                warn!("Failed to delete topic '{}': {}", topic_name, e);
+            }
         }
     }
 
@@ -684,8 +686,7 @@ async fn main() -> Result<()> {
     );
 
     // Generate topic name and connect to Kafka
-    let topic_name = generate_topic_name();
-    info!("Test topic: {}", topic_name);
+    let topic_name = args.topic.clone().unwrap_or_else(generate_topic_name);
 
     let admin_client = Arc::new(
         KafkaClient::connect(&args.broker)
@@ -694,15 +695,25 @@ async fn main() -> Result<()> {
     );
     let api_versions = admin_client.api_versions.clone();
 
-    // Create topic and wait for it to be ready
-    admin_client
-        .create_topic(&topic_name, total_partitions, 1)
-        .await
-        .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
-    // 3s delay allows Kafka to propagate metadata to all brokers before clients connect.
-    // Without this, consumers may get UNKNOWN_TOPIC_OR_PARTITION errors.
-    info!("Waiting for topic to be ready...");
-    sleep(Duration::from_secs(3)).await;
+    // Create topic or verify existing topic
+    let total_partitions = if args.use_existing_topic {
+        info!("Using existing topic: {}", topic_name);
+        let metadata = admin_client
+            .get_topic_metadata(&topic_name)
+            .await
+            .map_err(|e| anyhow!("Cannot use existing topic '{}': {}", topic_name, e))?;
+        info!("Topic '{}' has {} partitions", topic_name, metadata.partition_count);
+        metadata.partition_count
+    } else {
+        info!("Test topic: {}", topic_name);
+        admin_client
+            .create_topic(&topic_name, total_partitions, 1)
+            .await
+            .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
+        info!("Waiting for topic to be ready...");
+        sleep(Duration::from_secs(3)).await;
+        total_partitions
+    };
 
     // Log connection creation progress
     if args.produce_only.is_some() {
@@ -789,7 +800,7 @@ async fn main() -> Result<()> {
     }
 
     // Cleanup and finish
-    cleanup_topic(&admin_client, &topic_name, args.profile_report, args.quiet).await;
+    cleanup_topic(&admin_client, &topic_name, args.profile_report, args.quiet, args.use_existing_topic).await;
 
     Ok(())
 }
