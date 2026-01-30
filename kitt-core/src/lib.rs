@@ -12,7 +12,7 @@ pub mod runner;
 pub mod utils;
 
 // Re-export public API
-pub use client::KafkaClient;
+pub use client::{KafkaClient, TopicMetadata};
 pub use config::{KeyStrategy, MessageSize, ProduceOnlyMode, TestConfig, TestConfigBuilder};
 pub use consumer::Consumer;
 pub use events::{TestEvent, TestPhase, TestResults};

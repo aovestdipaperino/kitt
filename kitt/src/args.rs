@@ -98,6 +98,14 @@ pub struct Args {
     /// Quiet mode: suppress all UI output and print machine-readable results
     #[arg(short, long, default_value = "false")]
     pub quiet: bool,
+
+    /// Topic name to use (auto-generated if not specified)
+    #[arg(long)]
+    pub topic: Option<String>,
+
+    /// Use an existing topic instead of creating one (requires --topic)
+    #[arg(long, default_value = "false", requires = "topic")]
+    pub use_existing_topic: bool,
 }
 
 
@@ -191,5 +199,25 @@ mod tests {
         // Should generate keys from the pool
         let key = strategy.generate_key();
         assert!(key.is_some());
+    }
+
+    #[test]
+    fn test_use_existing_topic_flag() {
+        // Test default is false
+        let args = Args::try_parse_from(&["kitt"]).unwrap();
+        assert!(!args.use_existing_topic);
+        assert!(args.topic.is_none());
+
+        // Test flag with topic
+        let args = Args::try_parse_from(&["kitt", "--use-existing-topic", "--topic", "my-topic"]).unwrap();
+        assert!(args.use_existing_topic);
+        assert_eq!(args.topic, Some("my-topic".to_string()));
+    }
+
+    #[test]
+    fn test_use_existing_topic_requires_topic() {
+        // --use-existing-topic without --topic should fail
+        let result = Args::try_parse_from(&["kitt", "--use-existing-topic"]);
+        assert!(result.is_err());
     }
 }
