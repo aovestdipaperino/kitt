@@ -760,6 +760,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitt-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "crc32c",
+ "futures",
+ "indexmap",
+ "kafka-protocol",
+ "rand",
+ "serde",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kitt_throbbler"
 version = "0.1.3"
 dependencies = [
