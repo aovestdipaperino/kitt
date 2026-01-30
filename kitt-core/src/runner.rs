@@ -105,20 +105,68 @@ async fn run_test_inner(
     let (num_producer_threads, num_consumer_threads, total_partitions) =
         calculate_thread_config(&config)?;
 
-    // Generate topic name
+    // Get or generate topic name
     let topic_name = config.topic.clone().unwrap_or_else(generate_topic_name);
 
-    // Phase: Creating topic
-    let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::CreatingTopic }).await;
+    // Handle topic: either use existing or create new
+    let actual_partitions = if config.use_existing_topic {
+        // Phase: Fetching topic metadata (reuse WaitingForTopic phase)
+        let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::WaitingForTopic }).await;
 
-    admin_client
-        .create_topic(&topic_name, total_partitions, config.replication_factor)
-        .await
-        .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
+        let metadata = admin_client
+            .get_topic_metadata(&topic_name)
+            .await
+            .map_err(|e| anyhow!("Cannot use existing topic '{}': {}", topic_name, e))?;
 
-    // Phase: Waiting for topic
-    let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::WaitingForTopic }).await;
-    sleep(Duration::from_secs(3)).await;
+        metadata.partition_count
+    } else {
+        // Phase: Creating topic
+        let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::CreatingTopic }).await;
+
+        admin_client
+            .create_topic(&topic_name, total_partitions, config.replication_factor)
+            .await
+            .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
+
+        // Phase: Waiting for topic
+        let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::WaitingForTopic }).await;
+        sleep(Duration::from_secs(3)).await;
+
+        total_partitions
+    };
+
+    // Recalculate thread counts based on actual partitions when using existing topic
+    let (num_producer_threads, num_consumer_threads) = if config.use_existing_topic {
+        if config.sticky {
+            // In sticky mode, recalculate based on actual partitions
+            let num_producer_threads =
+                actual_partitions as usize / config.producer_partitions_per_thread as usize;
+            let num_consumer_threads =
+                actual_partitions as usize / config.consumer_partitions_per_thread as usize;
+            (num_producer_threads, num_consumer_threads)
+        } else {
+            // In random mode, use config values directly
+            (num_producer_threads, num_consumer_threads)
+        }
+    } else {
+        (num_producer_threads, num_consumer_threads)
+    };
+
+    // Validate recalculated thread counts when using existing topic
+    if config.use_existing_topic && config.sticky {
+        if num_producer_threads == 0 {
+            return Err(anyhow!(
+                "Existing topic has {} partitions, not enough for {} partitions per producer thread",
+                actual_partitions, config.producer_partitions_per_thread
+            ));
+        }
+        if num_consumer_threads == 0 && config.produce_only.is_none() {
+            return Err(anyhow!(
+                "Existing topic has {} partitions, not enough for {} partitions per consumer thread",
+                actual_partitions, config.consumer_partitions_per_thread
+            ));
+        }
+    }
 
     // Phase: Creating connections
     let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::CreatingConnections }).await;
@@ -126,7 +174,7 @@ async fn run_test_inner(
     let producers = create_producers(
         &config,
         &topic_name,
-        total_partitions,
+        actual_partitions,
         num_producer_threads,
         &api_versions,
     )
@@ -169,10 +217,12 @@ async fn run_test_inner(
     // Phase: Cleanup
     let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::Cleanup }).await;
 
-    if let Err(e) = admin_client.delete_topic(&topic_name).await {
-        let _ = events.send(TestEvent::Warning {
-            message: format!("Failed to delete topic '{}': {}", topic_name, e),
-        }).await;
+    if !config.use_existing_topic {
+        if let Err(e) = admin_client.delete_topic(&topic_name).await {
+            let _ = events.send(TestEvent::Warning {
+                message: format!("Failed to delete topic '{}': {}", topic_name, e),
+            }).await;
+        }
     }
 
     // Send completion event
