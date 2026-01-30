@@ -9,7 +9,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::utils::format_bytes;
+use kitt_core::utils::format_bytes;
 
 /// Width of the LED bar in number of positions
 ///

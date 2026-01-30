@@ -3,9 +3,9 @@
 //! This module provides the Consumer struct for fetching messages from Kafka topics.
 //! Each consumer instance runs in its own thread and targets specific partitions.
 
-use crate::kafka_client::KafkaClient;
 use crate::profiling::KittOperation;
-use crate::utils::verify_record_batch_crc;
+use kitt_core::utils::verify_record_batch_crc;
+use kitt_core::KafkaClient;
 use anyhow::Result;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use kafka_protocol::messages::fetch_response::FetchResponse;

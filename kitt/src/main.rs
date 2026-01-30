@@ -32,20 +32,19 @@ const BASE_MAX_BACKLOG: u64 = 1000;
 
 mod args;
 mod consumer;
-mod kafka_client;
 mod measurer;
 mod producer;
 pub mod profiling;
 mod ui;
-mod utils;
+
 use args::{Args, KeyStrategy, MessageSize};
 use consumer::Consumer;
-use kafka_client::KafkaClient;
+use kitt_core::utils::{format_bytes, lcm, parse_bytes};
+use kitt_core::KafkaClient;
 use measurer::{ThroughputMeasurer, LED_BAR_WIDTH};
 use producer::Producer;
 use profiling::KittOperation;
 use quantum_pulse::profile;
-use utils::{format_bytes, lcm, parse_bytes};
 
 // ============================================================================
 // Helper Functions for main() orchestration

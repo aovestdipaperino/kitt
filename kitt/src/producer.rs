@@ -4,9 +4,8 @@
 //! producing messages to Kafka topics with configurable batching, partitioning,
 //! and backpressure control.
 
-use crate::args::{KeyStrategy, MessageSize};
-use crate::kafka_client::KafkaClient;
 use crate::profiling::KittOperation;
+use kitt_core::{KafkaClient, KeyStrategy, MessageSize};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, ProduceRequest, TopicProduceData};
