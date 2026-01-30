@@ -111,6 +111,8 @@ pub struct TestConfig {
     pub broker: String,
     /// Topic name (None = auto-generate)
     pub topic: Option<String>,
+    /// Use an existing topic instead of creating one (requires topic to be set)
+    pub use_existing_topic: bool,
     /// Number of partitions for the test topic
     pub partitions: i32,
     /// Replication factor for the test topic
@@ -150,6 +152,7 @@ impl Default for TestConfig {
         Self {
             broker: "localhost:9092".to_string(),
             topic: None,
+            use_existing_topic: false,
             partitions: 8,
             replication_factor: 1,
             message_size: MessageSize::default(),
@@ -191,6 +194,12 @@ impl TestConfigBuilder {
     /// Set the topic name (None = auto-generate)
     pub fn topic(mut self, topic: Option<String>) -> Self {
         self.config.topic = topic;
+        self
+    }
+
+    /// Use an existing topic instead of creating one
+    pub fn use_existing_topic(mut self, use_existing: bool) -> Self {
+        self.config.use_existing_topic = use_existing;
         self
     }
 
@@ -306,6 +315,10 @@ impl TestConfigBuilder {
             return Err(anyhow!("consumer_partitions_per_thread must be at least 1"));
         }
 
+        if self.config.use_existing_topic && self.config.topic.is_none() {
+            return Err(anyhow!("use_existing_topic requires topic to be set"));
+        }
+
         Ok(self.config)
     }
 }
@@ -364,5 +377,25 @@ mod tests {
             .producer_threads(0)
             .build();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_use_existing_topic_requires_topic_name() {
+        let result = TestConfig::builder()
+            .use_existing_topic(true)
+            .build();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("topic"));
+    }
+
+    #[test]
+    fn test_config_use_existing_topic_valid() {
+        let config = TestConfig::builder()
+            .use_existing_topic(true)
+            .topic(Some("my-topic".to_string()))
+            .build()
+            .unwrap();
+        assert!(config.use_existing_topic);
+        assert_eq!(config.topic, Some("my-topic".to_string()));
     }
 }
