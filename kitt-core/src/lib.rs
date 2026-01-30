@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod config;
+pub mod consumer;
 pub mod events;
 pub mod producer;
 pub mod utils;
@@ -12,5 +13,6 @@ pub mod utils;
 // Re-export public API
 pub use client::KafkaClient;
 pub use config::{KeyStrategy, MessageSize, ProduceOnlyMode, TestConfig, TestConfigBuilder};
+pub use consumer::Consumer;
 pub use events::{TestEvent, TestPhase, TestResults};
 pub use producer::Producer;
