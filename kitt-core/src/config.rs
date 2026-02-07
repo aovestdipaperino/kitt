@@ -91,7 +91,7 @@ impl KeyStrategy {
 
 impl Default for KeyStrategy {
     fn default() -> Self {
-        KeyStrategy::NoKeys
+        KeyStrategy::from_pool_size(Some(16))
     }
 }
 

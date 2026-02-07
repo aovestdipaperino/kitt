@@ -3,28 +3,13 @@
 //! This module provides the `UiHandler` struct that receives `TestEvent`s from
 //! kitt-core and displays progress using the Knight Rider animation from kitt_throbbler.
 
+use crate::consts::{LED_BAR_WIDTH, LED_MOVEMENT_SPEED};
+use kitt_core::utils::format_bytes;
 use kitt_core::{TestEvent, TestPhase, TestResults};
 use kitt_throbbler::{AudioHandle, KnightRiderAnimator};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-
-use kitt_core::utils::format_bytes;
-
-/// Width of the LED bar in number of positions
-///
-/// This constant defines how many LED positions are available in the Knight Rider
-/// animation display during throughput measurements.
-#[allow(dead_code)]
-pub const LED_BAR_WIDTH: usize = 25;
-
-/// Constant controlling how many LED positions move per animation frame
-///
-/// This value affects the visual speed of the Knight Rider animation:
-/// - Lower values (1-2) create slower, smoother movement
-/// - Higher values (3-5) create faster, more energetic movement
-#[allow(dead_code)]
-pub const LED_MOVEMENT_SPEED: usize = 2;
 
 /// Handler for displaying test progress with Knight Rider animation
 ///

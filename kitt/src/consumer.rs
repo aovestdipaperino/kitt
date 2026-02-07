@@ -3,6 +3,10 @@
 //! This module provides the Consumer struct for fetching messages from Kafka topics.
 //! Each consumer instance runs in its own thread and targets specific partitions.
 
+use crate::consts::{
+    BASE_BACKOFF_MS, FETCH_MAX_BYTES, FETCH_MAX_WAIT_MS, FETCH_TIMEOUT_MS,
+    MAX_BACKOFF_MS, MAX_CONSECUTIVE_ERRORS, PARTITION_MAX_BYTES,
+};
 use crate::profiling::KittOperation;
 use kitt_core::utils::verify_record_batch_crc;
 use kitt_core::KafkaClient;
@@ -17,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Kafka message consumer that fetches messages from a specific topic
 /// Each consumer instance runs in its own thread and targets specific partitions
@@ -109,6 +113,9 @@ impl Consumer {
         let mut last_log_time = Instant::now();
         let mut fetch_count = 0u64;
 
+        // Retry logic: give up after MAX_CONSECUTIVE_ERRORS with exponential backoff
+        let mut consecutive_errors: u32 = 0;
+
         while Instant::now() < end_time {
             // Log at start of each loop iteration to track consumer activity
             let time_remaining = end_time
@@ -130,7 +137,7 @@ impl Consumer {
                 fetch_partition.current_leader_epoch = -1; // -1 skips epoch check (simpler but less safe)
                 fetch_partition.fetch_offset = offsets[idx];
                 fetch_partition.log_start_offset = -1;  // Broker will tell us where log starts
-                fetch_partition.partition_max_bytes = 1024 * 1024; // 1MB per partition prevents one partition from starving others
+                fetch_partition.partition_max_bytes = PARTITION_MAX_BYTES;
 
                 debug!(
                     "Thread {}: requesting partition {} at offset {}",
@@ -155,9 +162,9 @@ impl Consumer {
 
             // Fetch parameters tuned for throughput testing:
             let mut request = FetchRequest::default();
-            request.max_wait_ms = 1000;  // Wait up to 1s if no data; balances latency vs CPU usage
+            request.max_wait_ms = FETCH_MAX_WAIT_MS;
             request.min_bytes = 1;       // Return immediately when any data available
-            request.max_bytes = 50 * 1024 * 1024; // 50MB cap prevents memory spikes
+            request.max_bytes = FETCH_MAX_BYTES;
             request.isolation_level = 0; // 0=READ_UNCOMMITTED for maximum speed (no transaction overhead)
             request.session_id = 0;      // Fetch sessions disabled for simplicity
             request.session_epoch = -1;
@@ -171,9 +178,7 @@ impl Consumer {
             );
             let version = self.client.get_supported_version(ApiKey::Fetch, 4);
 
-            // 5s timeout is longer than max_wait_ms (1s) to account for network RTT.
-            // If this triggers, the broker is likely unresponsive.
-            let fetch_timeout = Duration::from_millis(5000);
+            let fetch_timeout = Duration::from_millis(FETCH_TIMEOUT_MS);
             match tokio::time::timeout(
                 fetch_timeout,
                 profile!(KittOperation::MessageConsume, {
@@ -183,6 +188,9 @@ impl Consumer {
             .await
             {
                 Ok(Ok(response_bytes)) => {
+                    // Successful response received, reset consecutive error counter
+                    consecutive_errors = 0;
+
                     // First decode the response header, then the fetch response payload
                     let mut response_cursor = std::io::Cursor::new(response_bytes.as_ref());
 
@@ -430,6 +438,7 @@ impl Consumer {
                     }
                 }
                 Ok(Err(request_err)) => {
+                    consecutive_errors += 1;
                     error!(
                         "Consumer thread {} FETCH REQUEST FAILED: {}",
                         self.thread_id, request_err
@@ -452,15 +461,29 @@ impl Consumer {
                     error!("FETCH CONFIG - topic: {}, partitions_per_thread: {}, max_wait: 1000ms, max_bytes: 50MB",
                            self.topic, self.consumer_partitions_per_thread);
 
-                    // Brief pause before retrying to avoid overwhelming broker with failed requests
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        error!(
+                            "Consumer thread {}: giving up after {} consecutive errors",
+                            self.thread_id, MAX_CONSECUTIVE_ERRORS
+                        );
+                        break;
+                    }
+
+                    let backoff_ms = BASE_BACKOFF_MS * 2u64.pow(consecutive_errors - 1);
+                    let backoff_ms = backoff_ms.min(MAX_BACKOFF_MS);
+                    warn!(
+                        "Consumer thread {}: retry {}/{} after fetch error, backing off {}ms",
+                        self.thread_id, consecutive_errors, MAX_CONSECUTIVE_ERRORS, backoff_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     // Yield to allow other tasks to continue processing
                     tokio::task::yield_now().await;
                 }
                 Err(_timeout_elapsed) => {
+                    consecutive_errors += 1;
                     error!(
-                        "Consumer thread {} FETCH TIMEOUT after 5s - broker not responding",
-                        self.thread_id
+                        "Consumer thread {} FETCH TIMEOUT after {}ms - broker not responding",
+                        self.thread_id, FETCH_TIMEOUT_MS
                     );
                     error!("TIMEOUT TROUBLESHOOT:");
                     error!("   - Broker may be overloaded or down");
@@ -469,8 +492,21 @@ impl Consumer {
                     error!("   - Topic '{}' may not exist on this broker", self.topic);
                     error!("Consider reducing fetch timeout or checking broker status");
 
-                    // Brief pause before retrying to avoid overwhelming broker with failed requests
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        error!(
+                            "Consumer thread {}: giving up after {} consecutive errors",
+                            self.thread_id, MAX_CONSECUTIVE_ERRORS
+                        );
+                        break;
+                    }
+
+                    let backoff_ms = BASE_BACKOFF_MS * 2u64.pow(consecutive_errors - 1);
+                    let backoff_ms = backoff_ms.min(MAX_BACKOFF_MS);
+                    warn!(
+                        "Consumer thread {}: retry {}/{} after fetch timeout, backing off {}ms",
+                        self.thread_id, consecutive_errors, MAX_CONSECUTIVE_ERRORS, backoff_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     // Yield to allow other tasks to continue processing
                     tokio::task::yield_now().await;
                 }

@@ -4,8 +4,12 @@
 //! producing messages to Kafka topics with configurable batching, partitioning,
 //! and backpressure control.
 
-use crate::config::{KeyStrategy, MessageSize};
 use crate::client::KafkaClient;
+use crate::config::{KeyStrategy, MessageSize};
+use crate::consts::{
+    BACKPRESSURE_PAUSE_MS, BASE_BACKOFF_MS, MAX_BACKOFF_MS, MAX_CONSECUTIVE_ERRORS,
+    MAX_PENDING_REQUESTS, PRODUCE_TIMEOUT_MS,
+};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, ProduceRequest, TopicProduceData};
@@ -17,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Configuration for the `produce_messages` method
 ///
@@ -135,11 +139,10 @@ impl Producer {
             0 // Not used in random mode
         };
 
-        // MAX_PENDING limits in-flight requests to avoid overwhelming the broker.
-        // 20 balances throughput (enough pipelining) vs memory (bounded queues).
-        const MAX_PENDING: usize = 20;
-
         let mut pending_futures = Vec::new();
+
+        // Retry logic: give up after MAX_CONSECUTIVE_ERRORS with exponential backoff
+        let mut consecutive_errors: u32 = 0;
 
         // When bytes_target is specified, ignore time limit and run until target is reached
         while bytes_target.is_some() || Instant::now() < end_time {
@@ -156,9 +159,7 @@ impl Producer {
             let backlog = sent.saturating_sub(received);
 
             if backlog > max_backlog {
-                // Backpressure: pause producer when consumer falls behind to prevent unbounded
-                // memory growth. 10ms is short enough to maintain throughput when consumer recovers.
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(BACKPRESSURE_PAUSE_MS)).await;
                 continue;
             }
 
@@ -166,8 +167,7 @@ impl Producer {
             let mut request = ProduceRequest::default();
             // acks=-1 (all): wait for all replicas. Strongest durability guarantee.
             request.acks = -1;
-            // 30s timeout allows for slow replicas without failing prematurely
-            request.timeout_ms = 30000;
+            request.timeout_ms = PRODUCE_TIMEOUT_MS;
 
             let mut topic_data = TopicProduceData::default();
             topic_data.name = TopicName(StrBytes::from_string(self.topic.clone()));
@@ -330,7 +330,7 @@ impl Producer {
 
             // Non-blocking drain: only reap completed futures when at capacity.
             // This avoids blocking on slow requests while maintaining the MAX_PENDING limit.
-            if pending_futures.len() >= MAX_PENDING {
+            if pending_futures.len() >= MAX_PENDING_REQUESTS {
                 let mut i = 0;
                 while i < pending_futures.len() {
                     if pending_futures[i].is_finished() {
@@ -338,11 +338,14 @@ impl Producer {
                         match result {
                             Ok(Ok(_)) => {
                                 // Successfully validated produce response
+                                consecutive_errors = 0;
                             }
                             Ok(Err(e)) => {
+                                consecutive_errors += 1;
                                 debug!("Producer validation failed: {}", e);
                             }
                             Err(e) => {
+                                consecutive_errors += 1;
                                 debug!("Failed to send batch: {}", e);
                             }
                         }
@@ -351,6 +354,23 @@ impl Producer {
                     }
                 }
             }
+
+            // Check consecutive errors and apply exponential backoff or give up
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                error!(
+                    "Producer thread {}: giving up after {} consecutive errors",
+                    self.thread_id, MAX_CONSECUTIVE_ERRORS
+                );
+                break;
+            } else if consecutive_errors > 0 {
+                let backoff_ms = BASE_BACKOFF_MS * 2u64.pow(consecutive_errors - 1);
+                let backoff_ms = backoff_ms.min(MAX_BACKOFF_MS);
+                warn!(
+                    "Producer thread {}: retry {}/{} after produce error, backing off {}ms",
+                    self.thread_id, consecutive_errors, MAX_CONSECUTIVE_ERRORS, backoff_ms
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
         }
 
         // Clean up: wait for all remaining requests to complete
@@ -358,11 +378,14 @@ impl Producer {
             match future.await {
                 Ok(Ok(_)) => {
                     // Successfully validated produce response
+                    consecutive_errors = 0;
                 }
                 Ok(Err(e)) => {
+                    consecutive_errors += 1;
                     debug!("Producer validation failed: {}", e);
                 }
                 Err(e) => {
+                    consecutive_errors += 1;
                     debug!("Failed to complete pending batch: {}", e);
                 }
             }

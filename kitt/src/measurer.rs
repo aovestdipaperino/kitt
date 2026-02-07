@@ -3,6 +3,7 @@
 //! This module provides the `ThroughputMeasurer` struct for tracking and displaying
 //! message production/consumption rates with visual feedback during tests.
 
+use crate::consts::{LED_BAR_WIDTH, LED_MOVEMENT_SPEED};
 use kitt_core::utils::format_bytes;
 use kitt_throbbler::KnightRiderAnimator;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,43 +12,6 @@ use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::time::interval;
 use tracing::info;
-
-/// Constant controlling how many LED positions move per animation frame
-///
-/// This value affects the visual speed of the Knight Rider animation:
-/// - Lower values (1-2) create slower, smoother movement
-/// - Higher values (3-5) create faster, more energetic movement
-///
-/// # Values
-/// - `1`: Slowest movement, individual LED changes
-/// - `2`: Standard movement speed (current default)
-/// - `3`: Faster movement, good for quick tests
-/// - `4-5`: Rapid movement, may be harder to follow
-///
-/// # Usage
-/// This value affects the bounce calculations at display edges and should
-/// be kept reasonable relative to the total LED count (50 positions).
-pub const LED_MOVEMENT_SPEED: usize = 2;
-
-/// Width of the LED bar in number of positions
-///
-/// This constant defines how many LED positions are available in the Knight Rider
-/// animation display during throughput measurements.
-///
-/// # Values
-/// - `30`: Compact display for narrow terminals
-/// - `50`: Standard width (current default)
-/// - `80`: Wide display for detailed visualization
-/// - `100+`: Very wide display (ensure terminal width is sufficient)
-///
-/// # Technical Details
-/// The LED animation bounces between position 0 and (LED_BAR_WIDTH - 1).
-/// Movement speed and bounce calculations are based on this width.
-///
-/// # Usage
-/// This value should be adjusted based on terminal width and visual preference.
-/// Ensure LED_MOVEMENT_SPEED is reasonable relative to this width.
-pub const LED_BAR_WIDTH: usize = 25;
 
 /// Measures and displays real-time throughput metrics with visual indicators
 ///

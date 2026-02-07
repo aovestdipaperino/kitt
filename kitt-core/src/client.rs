@@ -4,6 +4,9 @@
 //! using the Kafka protocol. It handles connection management, API version negotiation,
 //! and provides methods for topic management and message operations.
 
+use crate::consts::{
+    CONNECTION_BASE_DELAY_MS, CONNECTION_MAX_ATTEMPTS, MAX_RESPONSE_SIZE, TOPIC_OPERATION_TIMEOUT_MS,
+};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use kafka_protocol::{
@@ -142,8 +145,8 @@ impl KafkaClient {
     ///
     /// Retries connection with exponential backoff (1s, 2s, 4s, 8s, 16s, 32s) for up to 7 attempts
     async fn connect_with_retry(broker: &str) -> Result<TcpStream> {
-        let max_attempts = 7;
-        let base_delay_ms = 1000u64;
+        let max_attempts = CONNECTION_MAX_ATTEMPTS;
+        let base_delay_ms = CONNECTION_BASE_DELAY_MS;
 
         for attempt in 1..=max_attempts {
             match TcpStream::connect(broker).await {
@@ -264,8 +267,7 @@ impl KafkaClient {
         debug!("Reading response body of {} bytes", response_size);
 
         // Sanity check to prevent memory exhaustion from malformed responses
-        if response_size > 100 * 1024 * 1024 {
-            // 100MB limit for safety
+        if response_size > MAX_RESPONSE_SIZE {
             return Err(anyhow!("Response size too large: {} bytes", response_size));
         }
 
@@ -409,7 +411,7 @@ impl KafkaClient {
         // Additional topic configs (retention, cleanup policy, etc.) could be added here
 
         request.topics.push(creatable_topic);
-        request.timeout_ms = 30000; // 30-second timeout for topic creation
+        request.timeout_ms = TOPIC_OPERATION_TIMEOUT_MS;
 
         // Use compatible protocol version for this broker
         let version = self.get_supported_version(ApiKey::CreateTopics, 1);
@@ -451,7 +453,7 @@ impl KafkaClient {
 
         // Build DeleteTopics request
         let mut request = DeleteTopicsRequest::default();
-        request.timeout_ms = 30000; // 30-second timeout for topic deletion
+        request.timeout_ms = TOPIC_OPERATION_TIMEOUT_MS;
 
         // FORCE version 1 to eliminate any version negotiation issues
         // Version 1 is widely supported and uses the simple topic_names field

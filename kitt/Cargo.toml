@@ -36,3 +36,4 @@ kitt_throbbler = { path = "../kitt_throbbler" }
 kitt-core = { path = "../kitt-core" }
 quantum-pulse = { version = "0.1.6", features = ["full"] }
 mimalloc = "0.1"
+humantime = "2.1"

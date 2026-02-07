@@ -5,6 +5,9 @@
 
 use crate::client::KafkaClient;
 use crate::config::{ProduceOnlyMode, TestConfig};
+use crate::consts::{
+    BASE_MAX_BACKLOG, EVENT_CHANNEL_SIZE, PROGRESS_INTERVAL_MS, TOPIC_READY_WAIT_SECS,
+};
 use crate::consumer::Consumer;
 use crate::events::{TestEvent, TestPhase, TestResults};
 use crate::producer::{ProduceConfig, Producer};
@@ -20,12 +23,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, Instant};
-
-/// Base maximum backlog before applying backpressure
-const BASE_MAX_BACKLOG: u64 = 1000;
-
-/// Channel buffer size for events
-const EVENT_CHANNEL_SIZE: usize = 100;
 
 /// Handle to a running test
 ///
@@ -130,7 +127,7 @@ async fn run_test_inner(
 
         // Phase: Waiting for topic
         let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::WaitingForTopic }).await;
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(TOPIC_READY_WAIT_SECS)).await;
 
         total_partitions
     };
@@ -443,7 +440,7 @@ async fn run_measurement(
 
             let start_time = Instant::now();
             let end_time = start_time + measurement_duration;
-            let mut progress_interval = interval(Duration::from_millis(100));
+            let mut progress_interval = interval(Duration::from_millis(PROGRESS_INTERVAL_MS));
 
             let start_count = if produce_only {
                 messages_sent.load(Ordering::Relaxed)

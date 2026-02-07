@@ -3,10 +3,17 @@
 //! This module contains CLI argument parsing types including the main Args struct.
 //! The MessageSize and KeyStrategy types are re-exported from kitt-core.
 
+use std::time::Duration;
+
 use clap::Parser;
 
 // Re-export types from kitt-core for use by main.rs
 pub use kitt_core::{KeyStrategy, MessageSize};
+
+/// Parse a human-readable duration string (e.g., "1h30m", "15s", "2h", "90s")
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    humantime::parse_duration(s).map_err(|e| e.to_string())
+}
 
 /// Command-line arguments for configuring the throughput test
 #[derive(Parser)]
@@ -45,9 +52,9 @@ pub struct Args {
     #[arg(short, long, default_value = "1024")]
     pub message_size: String,
 
-    /// Measurement duration in seconds
-    #[arg(short, long, default_value = "15")]
-    pub duration_secs: u64,
+    /// Measurement duration (e.g., "15s", "1m", "1h30m", "2m30s")
+    #[arg(short, long, default_value = "15s", value_parser = parse_duration)]
+    pub duration: Duration,
 
     /// Enable detailed FETCH response diagnostics for troubleshooting
     #[arg(long, default_value = "false")]
@@ -77,10 +84,9 @@ pub struct Args {
     #[arg(long, default_value = "false")]
     pub silent: bool,
 
-    /// Generate random keys for messages. If a value is provided, creates a pool of that size
-    /// to pick keys from. If no value is provided, generates unique random keys on the fly.
-    #[arg(long, num_args = 0..=1, default_missing_value = "0")]
-    pub random_keys: Option<usize>,
+    /// Number of random keys in the pool (0 = null keys, default: 16)
+    #[arg(long, default_value = "16")]
+    pub random_keys: usize,
 
     /// Number of messages to include in each record batch (default: 1)
     #[arg(long, default_value = "1")]
@@ -202,6 +208,18 @@ mod tests {
     }
 
     #[test]
+    fn test_default_random_keys() {
+        let args = Args::try_parse_from(&["kitt"]).unwrap();
+        assert_eq!(args.random_keys, 16);
+    }
+
+    #[test]
+    fn test_random_keys_zero_means_no_keys() {
+        let args = Args::try_parse_from(&["kitt", "--random-keys", "0"]).unwrap();
+        assert_eq!(args.random_keys, 0);
+    }
+
+    #[test]
     fn test_use_existing_topic_flag() {
         // Test default is false
         let args = Args::try_parse_from(&["kitt"]).unwrap();
@@ -219,5 +237,44 @@ mod tests {
         // --use-existing-topic without --topic should fail
         let result = Args::try_parse_from(&["kitt", "--use-existing-topic"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_duration_default() {
+        let args = Args::try_parse_from(&["kitt"]).unwrap();
+        assert_eq!(args.duration, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_duration_seconds() {
+        let args = Args::try_parse_from(&["kitt", "--duration", "30s"]).unwrap();
+        assert_eq!(args.duration, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_duration_minutes() {
+        let args = Args::try_parse_from(&["kitt", "--duration", "2m"]).unwrap();
+        assert_eq!(args.duration, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_duration_hours() {
+        let args = Args::try_parse_from(&["kitt", "--duration", "1h"]).unwrap();
+        assert_eq!(args.duration, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_duration_composite() {
+        let args = Args::try_parse_from(&["kitt", "--duration", "1h30m"]).unwrap();
+        assert_eq!(args.duration, Duration::from_secs(5400));
+
+        let args = Args::try_parse_from(&["kitt", "--duration", "2m30s"]).unwrap();
+        assert_eq!(args.duration, Duration::from_secs(150));
+    }
+
+    #[test]
+    fn test_duration_short_flag() {
+        let args = Args::try_parse_from(&["kitt", "-d", "45s"]).unwrap();
+        assert_eq!(args.duration, Duration::from_secs(45));
     }
 }

@@ -25,12 +25,10 @@ use tracing::{info, warn};
 
 use producer::ProduceConfig;
 
-/// Base maximum number of pending messages allowed before applying backpressure.
-/// 1000 is chosen to allow burst absorption while preventing unbounded growth.
-/// Will be multiplied by fetch_delay to compensate for delayed consumer start.
-const BASE_MAX_BACKLOG: u64 = 1000;
+use consts::{BASE_MAX_BACKLOG, TOPIC_READY_WAIT_SECS};
 
 mod args;
+mod consts;
 mod consumer;
 mod measurer;
 mod producer;
@@ -41,7 +39,8 @@ use args::{Args, KeyStrategy, MessageSize};
 use consumer::Consumer;
 use kitt_core::utils::{format_bytes, lcm, parse_bytes};
 use kitt_core::KafkaClient;
-use measurer::{ThroughputMeasurer, LED_BAR_WIDTH};
+use consts::LED_BAR_WIDTH;
+use measurer::ThroughputMeasurer;
 use producer::Producer;
 use profiling::KittOperation;
 use quantum_pulse::profile;
@@ -166,7 +165,7 @@ fn print_startup_info(
             args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
         );
     }
-    info!("Running for: {}s", args.duration_secs);
+    info!("Running for: {:?}", args.duration);
 
     // Log validation setting
     if args.message_validation {
@@ -663,13 +662,15 @@ async fn main() -> Result<()> {
     let message_size = profile!(KittOperation::MessageSizeGeneration, {
         MessageSize::parse(&args.message_size)?
     });
-    let key_strategy = KeyStrategy::from_pool_size(args.random_keys);
-    if let Some(pool_size) = args.random_keys {
-        if pool_size == 0 {
-            info!("Using random keys: generating unique keys on the fly");
-        } else {
-            info!("Using random keys: pool of {} pre-generated keys", pool_size);
-        }
+    let key_strategy = if args.random_keys == 0 {
+        KeyStrategy::from_pool_size(None)
+    } else {
+        KeyStrategy::from_pool_size(Some(args.random_keys))
+    };
+    if args.random_keys == 0 {
+        info!("Using null keys (no message keys)");
+    } else {
+        info!("Using random keys: pool of {} pre-generated keys", args.random_keys);
     }
 
     // Calculate thread configuration and validate
@@ -711,7 +712,7 @@ async fn main() -> Result<()> {
             .await
             .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
         info!("Waiting for topic to be ready...");
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(TOPIC_READY_WAIT_SECS)).await;
         total_partitions
     };
 
@@ -757,7 +758,7 @@ async fn main() -> Result<()> {
 
     // Calculate backlog and timing configuration
     let max_backlog = calculate_max_backlog(&args, produce_only_target);
-    let measurement_duration = Duration::from_secs(args.duration_secs);
+    let measurement_duration = args.duration;
     let total_test_duration = measurement_duration + Duration::from_secs(args.fetch_delay);
     log_test_timing(&args, measurement_duration, total_test_duration);
 
