@@ -271,15 +271,16 @@ impl Producer {
 
             request.topic_data.push(topic_data);
 
-            // Track messages and bytes before sending (messages_per_batch per partition)
-            let total_messages_in_request = partition_count as u64 * self.messages_per_batch as u64;
-            messages_sent.fetch_add(total_messages_in_request, Ordering::Relaxed);
-            bytes_sent.fetch_add(total_bytes_in_request, Ordering::Relaxed);
-
-            // Send the batched request asynchronously
+            // Send the batched request asynchronously.
+            // Messages are counted AFTER the server acknowledges, not before,
+            // to prevent inflated backlog from eagerly-counted but not-yet-sent messages.
             let version = self.client.get_supported_version(ApiKey::Produce, 3);
             let client = self.client.clone();
             let thread_id = self.thread_id;
+            let msg_count = partition_count as u64 * self.messages_per_batch as u64;
+            let byte_count = total_bytes_in_request;
+            let msgs_sent = messages_sent.clone();
+            let bts_sent = bytes_sent.clone();
             let future = tokio::spawn(async move {
                 debug!(
                     "Producer thread {} sending batch with {} partitions, producer_id=-1 (idempotence disabled)",
@@ -288,6 +289,9 @@ impl Producer {
                 );
                 match client.send_request(ApiKey::Produce, &request, version).await {
                     Ok(response_bytes) => {
+                        // Count messages only after server acknowledges
+                        msgs_sent.fetch_add(msg_count, Ordering::Relaxed);
+                        bts_sent.fetch_add(byte_count, Ordering::Relaxed);
                         // Validate the produce response if enabled
                         if message_validation {
                             Self::validate_produce_response(
@@ -328,16 +332,15 @@ impl Producer {
             });
             pending_futures.push(future);
 
-            // Non-blocking drain: only reap completed futures when at capacity.
-            // This avoids blocking on slow requests while maintaining the MAX_PENDING limit.
+            // Drain completed futures; block when at capacity to bound in-flight requests.
             if pending_futures.len() >= MAX_PENDING_REQUESTS {
+                // First pass: reap any already-completed futures
                 let mut i = 0;
                 while i < pending_futures.len() {
                     if pending_futures[i].is_finished() {
                         let result = pending_futures.remove(i).await;
                         match result {
                             Ok(Ok(_)) => {
-                                // Successfully validated produce response
                                 consecutive_errors = 0;
                             }
                             Ok(Err(e)) => {
@@ -351,6 +354,23 @@ impl Producer {
                         }
                     } else {
                         i += 1;
+                    }
+                }
+                // If still at capacity, await the oldest request to prevent unbounded growth
+                if pending_futures.len() >= MAX_PENDING_REQUESTS {
+                    let result = pending_futures.remove(0).await;
+                    match result {
+                        Ok(Ok(_)) => {
+                            consecutive_errors = 0;
+                        }
+                        Ok(Err(e)) => {
+                            consecutive_errors += 1;
+                            debug!("Producer validation failed: {}", e);
+                        }
+                        Err(e) => {
+                            consecutive_errors += 1;
+                            debug!("Failed to send batch: {}", e);
+                        }
                     }
                 }
             }
