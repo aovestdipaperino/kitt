@@ -4,7 +4,9 @@
 //! that can be used to display progress, activity, or throughput metrics
 //! in terminal applications.
 
-use std::io::{self, Cursor, Write};
+use std::io::{self, Write};
+#[cfg(feature = "audio")]
+use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -130,6 +132,7 @@ impl KnightRiderAnimator {
     }
 
     /// Starts the audio playback loop in a separate thread
+    #[cfg(feature = "audio")]
     fn start_audio_loop(&self) -> Option<(thread::JoinHandle<()>, Arc<AtomicBool>)> {
         if !self.audio_enabled {
             return None;
@@ -179,6 +182,11 @@ impl KnightRiderAnimator {
         });
 
         Some((handle, stop_flag))
+    }
+
+    #[cfg(not(feature = "audio"))]
+    fn start_audio_loop(&self) -> Option<(thread::JoinHandle<()>, Arc<AtomicBool>)> {
+        None
     }
 
     /// Starts audio playback independently (for use with draw_frame)

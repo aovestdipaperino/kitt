@@ -10,6 +10,10 @@ homepage = "https://github.com/enzolombardi/kitt"
 repository = "https://github.com/enzolombardi/kitt"
 readme = "README.md"
 
+[features]
+default = ["audio"]
+audio = ["rodio"]
+
 [dependencies]
 tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
-rodio = "0.17"
+rodio = { version = "0.17", optional = true }
