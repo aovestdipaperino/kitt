@@ -460,12 +460,7 @@ impl KafkaClient {
         let version = 1i16;
 
         debug!(
-            "FORCED DeleteTopics API version {} (bypassing negotiation to avoid '0 topics' issue)",
-            version
-        );
-
-        debug!(
-            "Using DeleteTopics API version {} with topic_names field",
+            "Using DeleteTopics API version {} (forced to avoid '0 topics' issue)",
             version
         );
 
@@ -703,7 +698,7 @@ mod tests {
 
                     // Verify we have some content
                     assert!(
-                        buf.len() > 0,
+                        !buf.is_empty(),
                         "Encoded buffer should not be empty for version {}",
                         version
                     );
@@ -759,11 +754,11 @@ mod tests {
 
         // Both should have non-zero size
         assert!(
-            delete_buf.len() > 0,
+            !delete_buf.is_empty(),
             "DeleteTopics should encode to non-zero bytes"
         );
         assert!(
-            create_buf.len() > 0,
+            !create_buf.is_empty(),
             "CreateTopics should encode to non-zero bytes"
         );
     }
@@ -851,8 +846,8 @@ mod tests {
         println!("Combined: {} bytes", combined_buf.len());
 
         // Verify we have reasonable sizes
-        assert!(header_buf.len() > 0, "Header should not be empty");
-        assert!(body_buf.len() > 0, "Body should not be empty");
+        assert!(!header_buf.is_empty(), "Header should not be empty");
+        assert!(!body_buf.is_empty(), "Body should not be empty");
         assert_eq!(
             combined_buf.len(),
             header_buf.len() + body_buf.len(),
@@ -887,7 +882,7 @@ mod tests {
 
                     // Verify the compact format starts with the right pattern
                     // Compact arrays start with length + 1 (so 1 topic = 0x02)
-                    if buf.len() > 0 {
+                    if !buf.is_empty() {
                         println!("First byte (topic count + 1): 0x{:02x}", buf[0]);
                         assert_eq!(
                             buf[0], 0x02,

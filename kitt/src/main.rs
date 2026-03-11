@@ -66,6 +66,15 @@ fn setup_logging(quiet: bool) {
 ///
 /// Returns (num_producer_threads, num_consumer_threads, total_partitions)
 fn calculate_thread_config(args: &Args) -> Result<(usize, usize, i32)> {
+    // Validate partitions-per-thread before using them as divisors
+    if args.producer_partitions_per_thread <= 0 {
+        return Err(anyhow!("Producer partitions per thread must be at least 1"));
+    }
+
+    if args.consumer_partitions_per_thread <= 0 {
+        return Err(anyhow!("Consumer partitions per thread must be at least 1"));
+    }
+
     let (num_producer_threads, num_consumer_threads, total_partitions) = if args.sticky {
         // Sticky mode uses LCM to ensure each thread gets a whole number of partitions.
         // This guarantees no partition is shared between threads, maximizing locality.
@@ -95,21 +104,12 @@ fn calculate_thread_config(args: &Args) -> Result<(usize, usize, i32)> {
         (num_producer_threads, num_consumer_threads, total_partitions)
     };
 
-    // Validate configuration
     if num_producer_threads == 0 {
         return Err(anyhow!("Producer threads must be at least 1"));
     }
 
     if num_consumer_threads == 0 {
         return Err(anyhow!("Consumer threads must be at least 1"));
-    }
-
-    if args.producer_partitions_per_thread <= 0 {
-        return Err(anyhow!("Producer partitions per thread must be at least 1"));
-    }
-
-    if args.consumer_partitions_per_thread <= 0 {
-        return Err(anyhow!("Consumer partitions per thread must be at least 1"));
     }
 
     Ok((num_producer_threads, num_consumer_threads, total_partitions))
@@ -154,17 +154,11 @@ fn print_startup_info(
     println!("{}", include_str!("logo.txt"));
 
     info!("Starting Kitt - Kafka Implementation Throughput Tool");
-    if args.sticky {
-        info!(
-            "Mode: STICKY (LCM-based) - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
-            args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
-        );
-    } else {
-        info!(
-            "Mode: RANDOM - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
-            args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
-        );
-    }
+    let mode = if args.sticky { "STICKY (LCM-based)" } else { "RANDOM" };
+    info!(
+        "Mode: {} - Broker: {}, Producer partitions per thread: {}, Consumer partitions per thread: {}, Total partitions: {}, Producer threads: {}, Consumer threads: {}, message size: {:?}",
+        mode, args.broker, args.producer_partitions_per_thread, args.consumer_partitions_per_thread, total_partitions, num_producer_threads, num_consumer_threads, message_size
+    );
     info!("Running for: {:?}", args.duration);
 
     // Log validation setting

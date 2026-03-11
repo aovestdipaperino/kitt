@@ -232,7 +232,7 @@ impl Consumer {
                                             // Comprehensive FETCH response validation (if enabled)
                                             let fetch_diagnostics = if message_validation {
                                                 profile!(KittOperation::ResponseValidation, {
-                                                    Self::validate_fetch_response(
+                                                    kitt_core::Consumer::validate_fetch_response(
                                                         partition_id,
                                                         partition_response,
                                                         current_offset,
@@ -542,280 +542,30 @@ impl Consumer {
         Ok(())
     }
 
-    /// Validates and diagnoses FETCH response for troubleshooting
-    ///
-    /// This method performs comprehensive analysis of Kafka FETCH responses to identify
-    /// common issues that prevent message consumption, especially when connecting to
-    /// different brokers.
-    ///
-    /// # Arguments
-    /// * `partition_id` - The partition being analyzed
-    /// * `partition_response` - The fetch response for this partition
-    /// * `current_offset` - The offset requested in the fetch
-    /// * `thread_id` - Consumer thread ID for logging context
-    ///
-    /// # Returns
-    /// * `String` - Diagnostic summary with identified issues and recommendations
-    pub fn validate_fetch_response(
-        partition_id: usize,
-        partition_response: &kafka_protocol::messages::fetch_response::PartitionData,
-        current_offset: i64,
-        thread_id: usize,
-    ) -> String {
-        let mut diagnostics = Vec::new();
-
-        // Check for Kafka error codes
-        match partition_response.error_code {
-            0 => diagnostics.push("No partition errors".to_string()),
-            1 => {
-                diagnostics.push("OFFSET_OUT_OF_RANGE - requested offset is invalid".to_string())
-            }
-            3 => diagnostics
-                .push("UNKNOWN_TOPIC_OR_PARTITION - topic/partition doesn't exist".to_string()),
-            5 => diagnostics
-                .push("LEADER_NOT_AVAILABLE - partition leader is unavailable".to_string()),
-            6 => diagnostics
-                .push("NOT_LEADER_FOR_PARTITION - broker is not the leader".to_string()),
-            16 => {
-                diagnostics.push("NETWORK_EXCEPTION - network communication failed".to_string())
-            }
-            25 => {
-                diagnostics.push("INVALID_TOPIC_EXCEPTION - topic name is invalid".to_string())
-            }
-            29 => diagnostics
-                .push("TOPIC_AUTHORIZATION_FAILED - insufficient permissions".to_string()),
-            43 => diagnostics
-                .push("OFFSET_METADATA_TOO_LARGE - offset metadata too large".to_string()),
-            code => diagnostics.push(format!(
-                "Unknown error code: {} - check Kafka documentation",
-                code
-            )),
-        }
-
-        // Analyze offset positioning
-        let log_start = partition_response.log_start_offset;
-        let high_watermark = partition_response.high_watermark;
-
-        if current_offset < log_start {
-            diagnostics.push(format!(
-                "OFFSET_TOO_OLD - requesting {} but log starts at {} (data may be deleted)",
-                current_offset, log_start
-            ));
-        } else if current_offset >= high_watermark {
-            if high_watermark == log_start {
-                diagnostics.push("EMPTY_PARTITION - no messages in partition yet".to_string());
-            } else {
-                diagnostics.push(format!(
-                    "AT_END - requesting {} but latest is {} (caught up, waiting for new messages)",
-                    current_offset, high_watermark - 1
-                ));
-            }
-        } else {
-            diagnostics.push(format!(
-                "OFFSET_VALID - requesting {} in range [{}, {})",
-                current_offset, log_start, high_watermark
-            ));
-        }
-
-        // Check records field and content
-        match &partition_response.records {
-            Some(records) => {
-                if records.is_empty() {
-                    diagnostics.push(
-                        "EMPTY_RECORDS - records field present but contains no data"
-                            .to_string(),
-                    );
-                } else {
-                    diagnostics.push(format!(
-                        "HAS_RECORDS - {} bytes of record data",
-                        records.len()
-                    ));
-                }
-            }
-            None => {
-                diagnostics.push(
-                    "NO_RECORDS_FIELD - records field is missing from response".to_string(),
-                );
-            }
-        }
-
-        // Analyze broker response characteristics
-        if partition_response.error_code == 0 && partition_response.records.is_none() {
-            diagnostics.push("BROKER_ISSUE - success code but no records field (broker may not support this fetch version)".to_string());
-        }
-
-        if high_watermark == 0 && log_start == 0 {
-            diagnostics.push(
-                "NEW_PARTITION - partition appears to be newly created with no messages"
-                    .to_string(),
-            );
-        }
-
-        // Connection-specific diagnostics
-        if partition_response.error_code == 3 {
-            diagnostics.push(
-                "TROUBLESHOOT - verify topic exists on this broker and partition count"
-                    .to_string(),
-            );
-        } else if partition_response.error_code == 29 {
-            diagnostics.push(
-                "TROUBLESHOOT - check ACLs and authentication credentials for this broker"
-                    .to_string(),
-            );
-        } else if partition_response.error_code == 6 {
-            diagnostics.push(
-                "TROUBLESHOOT - metadata may be stale, broker may not be partition leader"
-                    .to_string(),
-            );
-        }
-
-        format!(
-            "[T{}:P{}] {}",
-            thread_id,
-            partition_id,
-            diagnostics.join(" | ")
-        )
-    }
 }
 
-/// Test function to validate FETCH response diagnostics
-///
-/// This function creates mock FETCH responses with various error conditions
-/// to verify that the diagnostic system correctly identifies issues.
+/// Delegates to kitt_core's fetch response validation test
 #[allow(dead_code)]
 pub fn test_fetch_response_validation() {
-    use kafka_protocol::messages::fetch_response::PartitionData;
-
-    println!("Testing FETCH Response Validation...\n");
-
-    // Test 1: Successful response with records
-    let mut success_response = PartitionData::default();
-    success_response.error_code = 0;
-    success_response.high_watermark = 100;
-    success_response.log_start_offset = 0;
-    success_response.records = Some(bytes::Bytes::from(vec![0x01, 0x02, 0x03]));
-
-    let result = Consumer::validate_fetch_response(0, &success_response, 50, 0);
-    println!("Success case: {}\n", result);
-
-    // Test 2: Offset out of range
-    let mut offset_error = PartitionData::default();
-    offset_error.error_code = 1;
-    offset_error.high_watermark = 100;
-    offset_error.log_start_offset = 10;
-
-    let result = Consumer::validate_fetch_response(0, &offset_error, 5, 0);
-    println!("Offset out of range: {}\n", result);
-
-    // Test 3: Unknown topic/partition
-    let mut unknown_topic = PartitionData::default();
-    unknown_topic.error_code = 3;
-    unknown_topic.high_watermark = 0;
-    unknown_topic.log_start_offset = 0;
-
-    let result = Consumer::validate_fetch_response(0, &unknown_topic, 0, 0);
-    println!("Unknown topic: {}\n", result);
-
-    // Test 4: Authorization failed
-    let mut auth_failed = PartitionData::default();
-    auth_failed.error_code = 29;
-    auth_failed.high_watermark = 100;
-    auth_failed.log_start_offset = 0;
-
-    let result = Consumer::validate_fetch_response(0, &auth_failed, 0, 0);
-    println!("Auth failed: {}\n", result);
-
-    // Test 5: Empty partition (caught up)
-    let mut empty_response = PartitionData::default();
-    empty_response.error_code = 0;
-    empty_response.high_watermark = 50;
-    empty_response.log_start_offset = 0;
-    empty_response.records = Some(bytes::Bytes::new());
-
-    let result = Consumer::validate_fetch_response(0, &empty_response, 50, 0);
-    println!("Caught up: {}\n", result);
-
-    // Test 6: Protocol version issue
-    let mut version_issue = PartitionData::default();
-    version_issue.error_code = 0;
-    version_issue.high_watermark = 100;
-    version_issue.log_start_offset = 0;
-    version_issue.records = None; // Missing records field
-
-    let result = Consumer::validate_fetch_response(0, &version_issue, 25, 0);
-    println!("Protocol issue: {}\n", result);
-
-    println!("FETCH Response Validation Tests Complete\n");
+    kitt_core::consumer::test_fetch_response_validation();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use kafka_protocol::messages::fetch_response::PartitionData;
 
     #[test]
     fn test_fetch_response_validation() {
-        // Test 1: Successful response with records
+        // Test via kitt_core's Consumer which owns the validation logic
         let mut success_response = PartitionData::default();
         success_response.error_code = 0;
         success_response.high_watermark = 100;
         success_response.log_start_offset = 0;
         success_response.records = Some(bytes::Bytes::from(vec![0x01, 0x02, 0x03]));
 
-        let result = Consumer::validate_fetch_response(0, &success_response, 50, 0);
+        let result = kitt_core::Consumer::validate_fetch_response(0, &success_response, 50, 0);
         assert!(result.contains("No partition errors"));
         assert!(result.contains("OFFSET_VALID"));
         assert!(result.contains("HAS_RECORDS"));
-
-        // Test 2: Offset out of range
-        let mut offset_error = PartitionData::default();
-        offset_error.error_code = 1;
-        offset_error.high_watermark = 100;
-        offset_error.log_start_offset = 10;
-
-        let result = Consumer::validate_fetch_response(0, &offset_error, 5, 0);
-        assert!(result.contains("OFFSET_OUT_OF_RANGE"));
-        assert!(result.contains("OFFSET_TOO_OLD"));
-
-        // Test 3: Unknown topic/partition
-        let mut unknown_topic = PartitionData::default();
-        unknown_topic.error_code = 3;
-        unknown_topic.high_watermark = 0;
-        unknown_topic.log_start_offset = 0;
-
-        let result = Consumer::validate_fetch_response(0, &unknown_topic, 0, 0);
-        assert!(result.contains("UNKNOWN_TOPIC_OR_PARTITION"));
-        assert!(result.contains("TROUBLESHOOT"));
-
-        // Test 4: Authorization failed
-        let mut auth_failed = PartitionData::default();
-        auth_failed.error_code = 29;
-        auth_failed.high_watermark = 100;
-        auth_failed.log_start_offset = 0;
-
-        let result = Consumer::validate_fetch_response(0, &auth_failed, 0, 0);
-        assert!(result.contains("TOPIC_AUTHORIZATION_FAILED"));
-
-        // Test 5: Empty partition (caught up)
-        let mut empty_response = PartitionData::default();
-        empty_response.error_code = 0;
-        empty_response.high_watermark = 50;
-        empty_response.log_start_offset = 0;
-        empty_response.records = Some(bytes::Bytes::new());
-
-        let result = Consumer::validate_fetch_response(0, &empty_response, 50, 0);
-        assert!(result.contains("AT_END"));
-        assert!(result.contains("EMPTY_RECORDS"));
-
-        // Test 6: Protocol version issue (success code but no records field)
-        let mut version_issue = PartitionData::default();
-        version_issue.error_code = 0;
-        version_issue.high_watermark = 100;
-        version_issue.log_start_offset = 0;
-        version_issue.records = None;
-
-        let result = Consumer::validate_fetch_response(0, &version_issue, 25, 0);
-        assert!(result.contains("NO_RECORDS_FIELD"));
-        assert!(result.contains("BROKER_ISSUE"));
     }
 }

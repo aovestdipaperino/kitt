@@ -423,7 +423,7 @@ impl Producer {
     ///
     /// # Returns
     /// * `Result<()>` - OK if response is valid, Error with diagnostic info if not
-    async fn validate_produce_response(
+    pub async fn validate_produce_response(
         response_bytes: &bytes::Bytes,
         version: i16,
         thread_id: usize,

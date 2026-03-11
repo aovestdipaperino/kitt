@@ -16,8 +16,13 @@ pub fn gcd(a: usize, b: usize) -> usize {
 }
 
 /// Calculate the Least Common Multiple of two numbers
+///
+/// Returns 0 if either argument is 0.
 pub fn lcm(a: usize, b: usize) -> usize {
-    a * b / gcd(a, b)
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    a / gcd(a, b) * b
 }
 
 /// Formats a byte count into a human-readable string (KB, MB, GB, etc.)
