@@ -409,16 +409,11 @@ impl Producer {
         // Clean up: wait for all remaining requests to complete
         for future in pending_futures {
             match future.await {
-                Ok(Ok(_)) => {
-                    // Successfully validated produce response
-                    consecutive_errors = 0;
-                }
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    consecutive_errors += 1;
                     debug!("Producer validation failed: {}", e);
                 }
                 Err(e) => {
-                    consecutive_errors += 1;
                     debug!("Failed to complete pending batch: {}", e);
                 }
             }
