@@ -151,7 +151,7 @@ fn print_startup_info(
         return;
     }
 
-    println!("{}", include_str!("logo.txt"));
+    println!("{}", include_str!(concat!(env!("OUT_DIR"), "/logo.txt")));
 
     info!("Starting Kitt - Kafka Implementation Throughput Tool");
     let mode = if args.sticky { "STICKY (LCM-based)" } else { "RANDOM" };

@@ -37,3 +37,6 @@ kitt-core = { path = "../kitt-core" }
 quantum-pulse = { version = "0.1.6", features = ["full"] }
 mimalloc = "0.1"
 humantime = "2.1"
+
+[build-dependencies]
+logo-art = "0.2.1"
