@@ -112,7 +112,8 @@ pub fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
         return Err(KittError::Protocol(format!("Record batch too short: {} bytes", data.len())));
     }
 
-    // Read batch length (offset 8, 4 bytes, big-endian)
+    // Safety: all indices 8..=20 are within bounds because data.len() >= 21 (checked above)
+    #[allow(clippy::indexing_slicing)]
     let batch_length = i32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
 
     // Total batch size = 8 (baseOffset) + 4 (batchLength) + batchLength
@@ -124,7 +125,8 @@ pub fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
         )));
     }
 
-    // Read magic byte (offset 16)
+    // Safety: index 16 is within bounds because data.len() >= 21 (checked above)
+    #[allow(clippy::indexing_slicing)]
     let magic = data[16];
     if magic != 2 {
         // Only verify CRC for magic version 2 (modern format)
@@ -132,10 +134,12 @@ pub fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
         return Ok(total_batch_size);
     }
 
-    // Read stored CRC (offset 17, 4 bytes, big-endian)
+    // Safety: indices 17..=20 are within bounds because data.len() >= 21 (checked above)
+    #[allow(clippy::indexing_slicing)]
     let stored_crc = u32::from_be_bytes([data[17], data[18], data[19], data[20]]);
 
-    // Compute CRC32-C over data from attributes (offset 21) to end of batch
+    // Safety: 21 <= total_batch_size and data.len() >= total_batch_size (checked above)
+    #[allow(clippy::indexing_slicing)]
     let crc_data = &data[21..total_batch_size];
     let computed_crc = crc32c::crc32c(crc_data);
 
@@ -149,6 +153,7 @@ pub fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

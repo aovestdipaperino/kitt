@@ -4,10 +4,6 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::indexing_slicing)]
-// TODO(nasa-rule-12): temporary allows — remove as violations are fixed in subsequent tasks
-#![allow(clippy::unwrap_used)]
-#![allow(clippy::expect_used)]
-#![allow(clippy::indexing_slicing)]
 #![allow(clippy::cast_lossless)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_possible_wrap)]
@@ -284,6 +280,7 @@ impl KnightRiderAnimator {
     /// let animator = KnightRiderAnimator::new();
     /// animator.draw_frame(5, 1, "100 msg/s (min: 50, max: 150, backlog: 1.0%)");
     /// ```
+    #[allow(clippy::indexing_slicing)] // Safety: assert ensures position < led_count; trail_pos < led_count checked before use
     pub fn draw_frame(&self, position: usize, direction: i32, status: &str) {
         // Precondition: position must be within the LED bar bounds
         assert!(position < self.led_count, "draw_frame: position {} must be < led_count {}", position, self.led_count);
@@ -447,6 +444,7 @@ impl KnightRiderAnimator {
     ///     animator.run_demo(10, 20, 10000.0).await;
     /// }
     /// ```
+    #[allow(clippy::indexing_slicing)] // Safety: current_pattern is always bounded by % patterns.len()
     pub async fn run_demo(&self, duration_secs: u64, base_speed_ms: u64, max_rate_value: f64) {
         // Preconditions: duration and speed must be positive
         assert!(duration_secs > 0, "run_demo: duration_secs must be > 0, got {}", duration_secs);
@@ -658,6 +656,7 @@ impl Default for KnightRiderAnimator {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

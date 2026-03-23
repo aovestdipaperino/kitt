@@ -197,6 +197,7 @@ impl Consumer {
     }
 
     /// Builds a fetch request for all partitions assigned to this consumer
+    #[allow(clippy::indexing_slicing)] // Safety: idx from enumerate is < partition_count == offsets.len()
     fn build_fetch_request(
         &self,
         start_partition: usize,
@@ -329,6 +330,7 @@ impl Consumer {
     }
 
     /// Processes a single partition response, decoding records and updating offsets
+    #[allow(clippy::indexing_slicing)] // Safety: all offsets[local_partition_idx] guarded by local_partition_idx < offsets.len()
     async fn process_partition(
         &self,
         partition_response: &kafka_protocol::messages::fetch_response::PartitionData,
@@ -393,6 +395,7 @@ impl Consumer {
     }
 
     /// Decodes records from a partition and updates offsets accordingly
+    #[allow(clippy::indexing_slicing)] // Safety: local_partition_idx bounds checked by caller; cursor position < records.len()
     async fn decode_partition_records(
         &self,
         partition_response: &kafka_protocol::messages::fetch_response::PartitionData,
@@ -577,6 +580,7 @@ fn advance_all_offsets(offsets: &mut [i64]) {
 }
 
 /// Adjusts offset for empty records
+#[allow(clippy::indexing_slicing)] // Safety: caller bounds-checks local_idx < offsets.len()
 fn adjust_offset_for_empty_records(
     offsets: &mut [i64],
     local_idx: usize,
@@ -591,6 +595,7 @@ fn adjust_offset_for_empty_records(
 }
 
 /// Advances offset to a valid position when no records field is present
+#[allow(clippy::indexing_slicing)] // Safety: caller bounds-checks local_idx < offsets.len()
 fn advance_offset_to_valid_position(
     offsets: &mut [i64],
     local_idx: usize,
@@ -613,6 +618,7 @@ pub fn test_fetch_response_validation() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use kafka_protocol::messages::fetch_response::PartitionData;
 

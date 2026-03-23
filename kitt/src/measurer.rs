@@ -357,6 +357,7 @@ fn update_animation_position(position: usize, direction: &mut i32) -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     #[test]
     fn test_measurement_timing_calculation() {

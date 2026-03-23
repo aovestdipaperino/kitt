@@ -204,6 +204,7 @@ impl Consumer {
     }
 
     /// Builds a fetch request for all partitions assigned to this consumer
+    #[allow(clippy::indexing_slicing)] // Safety: assert_eq ensures offsets.len() == partition_count; idx from enumerate is always < partition_count
     fn build_fetch_request(
         &self,
         start_partition: usize,
@@ -342,6 +343,7 @@ impl Consumer {
     }
 
     /// Processes a single partition response, decoding records and updating offsets
+    #[allow(clippy::indexing_slicing)] // Safety: all offsets[local_partition_idx] accesses are guarded by local_partition_idx < offsets.len()
     fn process_partition(
         &self,
         partition_response: &kafka_protocol::messages::fetch_response::PartitionData,
@@ -404,6 +406,7 @@ impl Consumer {
     }
 
     /// Decodes records from a partition and updates offsets accordingly
+    #[allow(clippy::indexing_slicing)] // Safety: asserts ensure local_partition_idx < offsets.len(); cursor position < records.len()
     fn decode_partition_records(
         partition_response: &kafka_protocol::messages::fetch_response::PartitionData,
         offsets: &mut [i64],
@@ -725,6 +728,7 @@ fn advance_all_offsets(offsets: &mut [i64]) {
 }
 
 /// Adjusts offset for empty records - jumps to valid position to avoid getting stuck
+#[allow(clippy::indexing_slicing)] // Safety: caller (decode_partition_records) asserts local_idx < offsets.len()
 fn adjust_offset_for_empty_records(
     offsets: &mut [i64],
     local_idx: usize,
@@ -742,6 +746,7 @@ fn adjust_offset_for_empty_records(
 }
 
 /// Advances offset to a valid position when no records field is present
+#[allow(clippy::indexing_slicing)] // Safety: caller (decode_partition_records) asserts local_idx < offsets.len()
 fn advance_offset_to_valid_position(
     offsets: &mut [i64],
     local_idx: usize,
@@ -828,6 +833,7 @@ pub fn test_fetch_response_validation() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use kafka_protocol::messages::fetch_response::PartitionData;

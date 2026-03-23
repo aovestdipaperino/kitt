@@ -600,6 +600,7 @@ fn log_produce_request_error(thread_id: usize, err: &KittError) {
 }
 
 /// Drains completed futures from the pending list, blocking if at capacity
+#[allow(clippy::indexing_slicing)] // Safety: i < pending_futures.len() is checked by while loop condition
 async fn drain_pending_futures(
     pending_futures: &mut Vec<tokio::task::JoinHandle<Result<()>>>,
     consecutive_errors: &mut u32,
@@ -745,6 +746,7 @@ pub fn test_produce_response_validation() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
