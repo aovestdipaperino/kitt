@@ -275,7 +275,7 @@ impl Consumer {
                                                             if let Err(crc_err) =
                                                                 verify_record_batch_crc(remaining_data)
                                                             {
-                                                                panic!(
+                                                                anyhow::bail!(
                                                                     "CRC verification failed for partition {}: {}",
                                                                     partition_id, crc_err
                                                                 );

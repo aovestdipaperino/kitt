@@ -93,6 +93,7 @@ use quantum_pulse::profile;
 // ============================================================================
 
 /// Initialize tracing subscriber for structured logging
+#[allow(clippy::unwrap_used)] // Init-time: hardcoded tracing directives cannot fail
 fn setup_logging(quiet: bool) {
     let default_level = if quiet { "error" } else { "info" };
     tracing_subscriber::fmt()
@@ -176,9 +177,9 @@ fn generate_topic_name() -> String {
     ];
 
     let mut rng = thread_rng();
-    let adj = adjectives.choose(&mut rng).unwrap();
-    let noun = nouns.choose(&mut rng).unwrap();
-    let verb = verbs.choose(&mut rng).unwrap();
+    let adj = adjectives.choose(&mut rng).unwrap_or(&"swift");
+    let noun = nouns.choose(&mut rng).unwrap_or(&"stream");
+    let verb = verbs.choose(&mut rng).unwrap_or(&"flowing");
     format!("topic-{}-{}-{}", adj, noun, verb)
 }
 
@@ -885,7 +886,7 @@ async fn run_profile_demo() -> Result<()> {
 
         if batch < 4 {
             print!(".");
-            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     }
     println!(" Done");
@@ -904,7 +905,7 @@ async fn run_profile_demo() -> Result<()> {
         }
         if fetch < 7 {
             print!(".");
-            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     }
     println!(" Done");

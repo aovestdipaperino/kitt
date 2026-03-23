@@ -82,7 +82,7 @@ impl KeyStrategy {
             KeyStrategy::NoKeys => None,
             KeyStrategy::RandomOnTheFly => Some(Bytes::from(uuid::Uuid::new_v4().to_string())),
             KeyStrategy::RandomPool(pool) => {
-                let key = pool.choose(&mut thread_rng()).expect("pool should not be empty");
+                let key = pool.choose(&mut thread_rng())?;
                 Some(key.clone())
             }
         }

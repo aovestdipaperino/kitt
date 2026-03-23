@@ -269,10 +269,10 @@ impl Consumer {
                                                             if let Err(crc_err) =
                                                                 verify_record_batch_crc(remaining_data)
                                                             {
-                                                                panic!(
-                                                                    "CRC verification failed for partition {}: {}",
-                                                                    partition_id, crc_err
-                                                                );
+                                                                return Err(crate::error::KittError::CrcFailure {
+                                                                    partition: partition_id,
+                                                                    detail: crc_err.to_string(),
+                                                                });
                                                             }
 
                                                             match RecordBatchDecoder::decode(

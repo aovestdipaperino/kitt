@@ -280,9 +280,9 @@ fn generate_topic_name() -> String {
     ];
 
     let mut rng = thread_rng();
-    let adj = adjectives.choose(&mut rng).unwrap();
-    let noun = nouns.choose(&mut rng).unwrap();
-    let verb = verbs.choose(&mut rng).unwrap();
+    let adj = adjectives.choose(&mut rng).unwrap_or(&"swift");
+    let noun = nouns.choose(&mut rng).unwrap_or(&"stream");
+    let verb = verbs.choose(&mut rng).unwrap_or(&"flowing");
     format!("topic-{}-{}-{}", adj, noun, verb)
 }
 

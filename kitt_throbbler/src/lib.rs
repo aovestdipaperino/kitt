@@ -190,7 +190,9 @@ impl KnightRiderAnimator {
                 }
             };
 
-            let sink = rodio::Sink::try_new(&stream_handle).unwrap();
+            let Ok(sink) = rodio::Sink::try_new(&stream_handle) else {
+                return; // Skip audio if sink creation fails
+            };
 
             // Embed the MP3 file data at compile time
             const SFX_DATA: &[u8] = include_bytes!("assets/sfx.mp3");
@@ -341,7 +343,7 @@ impl KnightRiderAnimator {
         }
 
         // Force immediate output to terminal (bypass buffering)
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
     }
 
     /// Starts an animation loop that continues until stopped
@@ -602,7 +604,7 @@ impl AnimationHandle {
 
         // Clear the animation line
         print!("\r");
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
     }
 }
 
