@@ -3,7 +3,7 @@
 //! This module contains helper functions for common operations like
 //! mathematical calculations, byte formatting/parsing, and CRC verification.
 
-use anyhow::{anyhow, Result};
+use crate::error::{KittError, Result};
 use tracing::debug;
 
 /// Calculate the Greatest Common Divisor of two numbers
@@ -59,7 +59,7 @@ pub fn parse_bytes(s: &str) -> Result<u64> {
     let (num_str, unit) = s.split_at(numeric_end);
     let num: f64 = num_str
         .parse()
-        .map_err(|_| anyhow!("Invalid number in size: {}", s))?;
+        .map_err(|_| KittError::Protocol(format!("Invalid number in size: {s}")))?;
 
     let multiplier = match unit.trim() {
         "" | "B" => 1,
@@ -67,7 +67,7 @@ pub fn parse_bytes(s: &str) -> Result<u64> {
         "M" | "MB" | "MIB" => MB,
         "G" | "GB" | "GIB" => GB,
         "T" | "TB" | "TIB" => TB,
-        _ => return Err(anyhow!("Unknown unit in size: {}", unit)),
+        _ => return Err(KittError::Protocol(format!("Unknown unit in size: {unit}"))),
     };
 
     Ok((num * multiplier as f64) as u64)
@@ -87,7 +87,7 @@ pub fn parse_bytes(s: &str) -> Result<u64> {
 pub fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
     // Minimum size for a record batch header
     if data.len() < 21 {
-        return Err(anyhow!("Record batch too short: {} bytes", data.len()));
+        return Err(KittError::Protocol(format!("Record batch too short: {} bytes", data.len())));
     }
 
     // Read batch length (offset 8, 4 bytes, big-endian)
@@ -96,11 +96,10 @@ pub fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
     // Total batch size = 8 (baseOffset) + 4 (batchLength) + batchLength
     let total_batch_size = 12 + batch_length;
     if data.len() < total_batch_size {
-        return Err(anyhow!(
-            "Incomplete record batch: expected {} bytes, got {}",
-            total_batch_size,
+        return Err(KittError::Protocol(format!(
+            "Incomplete record batch: expected {total_batch_size} bytes, got {}",
             data.len()
-        ));
+        )));
     }
 
     // Read magic byte (offset 16)
@@ -119,11 +118,9 @@ pub fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
     let computed_crc = crc32c::crc32c(crc_data);
 
     if stored_crc != computed_crc {
-        return Err(anyhow!(
-            "CRC mismatch: stored=0x{:08x}, computed=0x{:08x}",
-            stored_crc,
-            computed_crc
-        ));
+        return Err(KittError::Protocol(format!(
+            "CRC mismatch: stored=0x{stored_crc:08x}, computed=0x{computed_crc:08x}"
+        )));
     }
 
     Ok(total_batch_size)

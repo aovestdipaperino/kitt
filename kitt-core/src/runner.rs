@@ -13,7 +13,7 @@ use crate::events::{TestEvent, TestPhase, TestResults};
 use crate::producer::{ProduceConfig, Producer};
 use crate::utils::lcm;
 
-use anyhow::{anyhow, Result};
+use crate::error::{KittError, Result};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::HashMap;
@@ -37,7 +37,7 @@ pub struct TestHandle {
 impl TestHandle {
     /// Wait for the test to complete and return results
     pub async fn wait(self) -> Result<TestResults> {
-        self.handle.await?
+        self.handle.await.map_err(|e| KittError::Protocol(format!("Test task panicked: {e}")))?
     }
 
     /// Abort the test
@@ -94,7 +94,7 @@ async fn run_test_inner(
     let admin_client = Arc::new(
         KafkaClient::connect(&config.broker)
             .await
-            .map_err(|e| anyhow!("Failed to connect admin client: {}", e))?,
+            .map_err(|e| KittError::Protocol(format!("Failed to connect admin client: {e}")))?,
     );
     let api_versions = admin_client.api_versions.clone();
 
@@ -113,7 +113,7 @@ async fn run_test_inner(
         let metadata = admin_client
             .get_topic_metadata(&topic_name)
             .await
-            .map_err(|e| anyhow!("Cannot use existing topic '{}': {}", topic_name, e))?;
+            .map_err(|e| KittError::TopicOperation(format!("Cannot use existing topic '{topic_name}': {e}")))?;
 
         metadata.partition_count
     } else {
@@ -123,7 +123,7 @@ async fn run_test_inner(
         admin_client
             .create_topic(&topic_name, total_partitions, config.replication_factor)
             .await
-            .map_err(|e| anyhow!("Topic creation failed: {}", e))?;
+            .map_err(|e| KittError::TopicOperation(format!("Topic creation failed: {e}")))?;
 
         // Phase: Waiting for topic
         let _ = events.send(TestEvent::PhaseChange { phase: TestPhase::WaitingForTopic }).await;
@@ -152,16 +152,16 @@ async fn run_test_inner(
     // Validate recalculated thread counts when using existing topic
     if config.use_existing_topic && config.sticky {
         if num_producer_threads == 0 {
-            return Err(anyhow!(
+            return Err(KittError::TopicOperation(format!(
                 "Existing topic has {} partitions, not enough for {} partitions per producer thread",
                 actual_partitions, config.producer_partitions_per_thread
-            ));
+            )));
         }
         if num_consumer_threads == 0 && config.produce_only.is_none() {
-            return Err(anyhow!(
+            return Err(KittError::TopicOperation(format!(
                 "Existing topic has {} partitions, not enough for {} partitions per consumer thread",
                 actual_partitions, config.consumer_partitions_per_thread
-            ));
+            )));
         }
     }
 
@@ -253,10 +253,10 @@ fn calculate_thread_config(config: &TestConfig) -> Result<(usize, usize, i32)> {
     };
 
     if num_producer_threads == 0 {
-        return Err(anyhow!("Producer threads must be at least 1"));
+        return Err(KittError::Protocol("Producer threads must be at least 1".to_string()));
     }
     if num_consumer_threads == 0 && config.produce_only.is_none() {
-        return Err(anyhow!("Consumer threads must be at least 1"));
+        return Err(KittError::Protocol("Consumer threads must be at least 1".to_string()));
     }
 
     Ok((num_producer_threads, num_consumer_threads, total_partitions))
@@ -300,7 +300,7 @@ async fn create_producers(
         let producer_client = Arc::new(
             KafkaClient::connect_with_versions(&config.broker, api_versions.clone())
                 .await
-                .map_err(|e| anyhow!("Failed to connect producer client {}: {}", i, e))?,
+                .map_err(|e| KittError::Protocol(format!("Failed to connect producer client {i}: {e}")))?,
         );
         producers.push(Producer::new(
             producer_client,
@@ -335,7 +335,7 @@ async fn create_consumers(
         let consumer_client = Arc::new(
             KafkaClient::connect_with_versions(&config.broker, api_versions.clone())
                 .await
-                .map_err(|e| anyhow!("Failed to connect consumer client {}: {}", i, e))?,
+                .map_err(|e| KittError::Protocol(format!("Failed to connect consumer client {i}: {e}")))?,
         );
         consumers.push(Consumer::new(
             consumer_client,

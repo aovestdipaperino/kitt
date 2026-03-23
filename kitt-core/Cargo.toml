@@ -15,6 +15,7 @@ kafka-protocol = { version = "0.15.1", features = ["broker", "messages_enums"] }
 tokio = { version = "1.41.0", features = ["full"] }
 rand = "0.8.5"
 anyhow = "1.0.80"
+thiserror = "2"
 tracing = "0.1.37"
 bytes = "1.10.1"
 crc32c = "0.6"

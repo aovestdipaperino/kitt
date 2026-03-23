@@ -10,7 +10,7 @@ use crate::consts::{
     BACKPRESSURE_PAUSE_MS, BASE_BACKOFF_MS, MAX_BACKOFF_MS, MAX_CONSECUTIVE_ERRORS,
     MAX_PENDING_REQUESTS, PRODUCE_TIMEOUT_MS,
 };
-use anyhow::{anyhow, Result};
+use crate::error::{KittError, Result};
 use bytes::Bytes;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, ProduceRequest, TopicProduceData};
 use kafka_protocol::messages::produce_response::ProduceResponse;
@@ -230,7 +230,9 @@ impl Producer {
                     total_bytes_in_request += size as u64;
                     let payload = vec![b'x'; size];
                     let timestamp =
-                        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+                        SystemTime::now().duration_since(UNIX_EPOCH)
+                            .map_err(|e| KittError::Protocol(format!("System time error: {e}")))?
+                            .as_millis() as i64;
 
                     // Generate message key based on configured strategy (different key for each message)
                     let key = self.key_strategy.generate_key();
@@ -259,7 +261,7 @@ impl Producer {
                     &mut batch_buf,
                     records.iter().collect::<Vec<_>>(),
                     &options,
-                )?;
+                ).map_err(|e| KittError::ProduceError(format!("Failed to encode record batch: {e}")))?;
                 let batch = batch_buf.freeze();
 
                 // Create partition data
@@ -448,7 +450,7 @@ impl Producer {
                     header_version,
                     response_bytes.len()
                 );
-                return Err(anyhow!("Failed to decode produce response header: {}", e));
+                return Err(KittError::Protocol(format!("Failed to decode produce response header: {e}")));
             }
         };
 
@@ -466,7 +468,7 @@ impl Producer {
                     response_bytes.len(),
                     version
                 );
-                return Err(anyhow!("Failed to decode produce response: {}", e));
+                return Err(KittError::Protocol(format!("Failed to decode produce response: {e}")));
             }
         };
 
@@ -686,10 +688,10 @@ impl Producer {
                 debug!("   - Verify broker version compatibility");
             }
 
-            return Err(anyhow!(
+            return Err(KittError::ProduceError(format!(
                 "Produce request failed for {} partitions",
                 diagnostics.iter().filter(|d| d.contains("P") && !d.contains("SUCCESS")).count()
-            ));
+            )));
         }
 
         Ok(())

@@ -7,7 +7,7 @@
 use crate::consts::{
     CONNECTION_BASE_DELAY_MS, CONNECTION_MAX_ATTEMPTS, MAX_RESPONSE_SIZE, TOPIC_OPERATION_TIMEOUT_MS,
 };
-use anyhow::{anyhow, Result};
+use crate::error::{KittError, Result};
 use bytes::Bytes;
 use kafka_protocol::{
     messages::{
@@ -131,7 +131,10 @@ impl KafkaClient {
         // Establish TCP connection (same as connect() but without version discovery)
         let stream = TcpStream::connect(broker)
             .await
-            .map_err(|e| anyhow!("Failed to connect to Kafka broker at {}: {}", broker, e))?;
+            .map_err(|e| KittError::Connection {
+                broker: broker.to_string(),
+                source: e,
+            })?;
 
         debug!("Successfully connected to Kafka broker");
         Ok(KafkaClient {
@@ -161,12 +164,10 @@ impl KafkaClient {
                 }
                 Err(e) => {
                     if attempt == max_attempts {
-                        return Err(anyhow!(
-                            "Failed to connect to Kafka broker at {} after {} attempts: {}",
-                            broker,
-                            max_attempts,
-                            e
-                        ));
+                        return Err(KittError::Connection {
+                            broker: broker.to_string(),
+                            source: e,
+                        });
                     }
 
                     // Exponential backoff: 1s, 2s, 4s, 8s
@@ -237,10 +238,10 @@ impl KafkaClient {
         let mut buf = Vec::new();
         header
             .encode(&mut buf, header_version)
-            .map_err(|e| anyhow!("Failed to encode request header: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to encode request header: {e}")))?;
         request
             .encode(&mut buf, version)
-            .map_err(|e| anyhow!("Failed to encode request body: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to encode request body: {e}")))?;
 
         // Kafka protocol uses 4-byte big-endian length prefix
         let message_size = buf.len() as i32;
@@ -255,20 +256,23 @@ impl KafkaClient {
         stream
             .write_all(&message)
             .await
-            .map_err(|e| anyhow!("Failed to write request to stream: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to write request to stream: {e}")))?;
 
         // Read response using Kafka protocol framing
         debug!("Reading response size");
         let mut size_buf = [0u8; 4];
         stream.read_exact(&mut size_buf).await
-            .map_err(|e| anyhow!("Failed to read response size: {} (this could indicate the broker closed the connection)", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to read response size: {e} (this could indicate the broker closed the connection)")))?;
 
         let response_size = i32::from_be_bytes(size_buf) as usize;
         debug!("Reading response body of {} bytes", response_size);
 
         // Sanity check to prevent memory exhaustion from malformed responses
         if response_size > MAX_RESPONSE_SIZE {
-            return Err(anyhow!("Response size too large: {} bytes", response_size));
+            return Err(KittError::ResponseTooLarge {
+                size: response_size,
+                max: MAX_RESPONSE_SIZE,
+            });
         }
 
         // Read the complete response payload
@@ -276,7 +280,7 @@ impl KafkaClient {
         stream
             .read_exact(&mut response_buf)
             .await
-            .map_err(|e| anyhow!("Failed to read response body: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to read response body: {e}")))?;
 
         debug!("Successfully received response");
         Ok(Bytes::from(response_buf))
@@ -304,11 +308,11 @@ impl KafkaClient {
 
         // Decode response header (contains correlation ID, error codes, etc.)
         let _response_header = ResponseHeader::decode(&mut cursor, 0)
-            .map_err(|e| anyhow!("Failed to decode response header: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to decode response header: {e}")))?;
 
         // Decode the ApiVersions response payload
         let response = ApiVersionsResponse::decode(&mut cursor, 0)
-            .map_err(|e| anyhow!("Failed to decode ApiVersions response: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to decode ApiVersions response: {e}")))?;
 
         // Cache supported version ranges for each API
         // This allows us to select compatible versions for future requests
@@ -418,7 +422,7 @@ impl KafkaClient {
         let _response_bytes = self
             .send_request(ApiKey::CreateTopics, &request, version)
             .await
-            .map_err(|e| anyhow!("Failed to create topic '{}': {}", topic, e))?;
+            .map_err(|e| KittError::TopicOperation(format!("Failed to create topic '{topic}': {e}")))?;
 
         // TODO: Parse response to check for errors (topic already exists, insufficient replicas, etc.)
         info!(
@@ -478,8 +482,8 @@ impl KafkaClient {
 
         // CRITICAL VERIFICATION: Ensure topic_names is populated before sending
         if request.topic_names.is_empty() {
-            return Err(anyhow!(
-                "FATAL: topic_names field is empty - this would cause '0 topics' error"
+            return Err(KittError::TopicOperation(
+                "FATAL: topic_names field is empty - this would cause '0 topics' error".to_string(),
             ));
         }
 
@@ -498,7 +502,7 @@ impl KafkaClient {
         let response_bytes = self
             .send_request(ApiKey::DeleteTopics, &request, version)
             .await
-            .map_err(|e| anyhow!("Failed to delete topic '{}': {}", topic, e))?;
+            .map_err(|e| KittError::TopicOperation(format!("Failed to delete topic '{topic}': {e}")))?;
 
         // Parse response to check for errors
         let mut cursor = std::io::Cursor::new(response_bytes.as_ref());
@@ -506,11 +510,11 @@ impl KafkaClient {
         // Decode response header
         let response_header_version = ApiKey::DeleteTopics.response_header_version(version);
         let _response_header = ResponseHeader::decode(&mut cursor, response_header_version)
-            .map_err(|e| anyhow!("Failed to decode response header: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to decode response header: {e}")))?;
 
         // Decode delete topics response
         let response = DeleteTopicsResponse::decode(&mut cursor, version)
-            .map_err(|e| anyhow!("Failed to decode delete topics response: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to decode delete topics response: {e}")))?;
 
         // Check for errors in the response
         let response_count = response.responses.len();
@@ -545,7 +549,9 @@ impl KafkaClient {
                         65 => "Unknown server error".to_string(),
                         _ => format!("Unknown Kafka error code: {}", topic_result.error_code),
                     };
-                    return Err(anyhow!("Failed to delete topic '{}': {}", topic, error_msg));
+                    return Err(KittError::TopicOperation(format!(
+                        "Failed to delete topic '{topic}': {error_msg}"
+                    )));
                 }
                 info!("Successfully deleted topic '{}'", topic);
                 return Ok(());
@@ -553,11 +559,9 @@ impl KafkaClient {
         }
 
         // Topic not found in response - this shouldn't normally happen
-        Err(anyhow!(
-            "Topic '{}' not found in delete response (received {} topics in response)",
-            topic,
-            response_count
-        ))
+        Err(KittError::TopicOperation(format!(
+            "Topic '{topic}' not found in delete response (received {response_count} topics in response)"
+        )))
     }
 
     /// Gets metadata for an existing topic
@@ -583,15 +587,15 @@ impl KafkaClient {
         let response_bytes = self
             .send_request(ApiKey::Metadata, &request, version)
             .await
-            .map_err(|e| anyhow!("Failed to get metadata for topic '{}': {}", topic, e))?;
+            .map_err(|e| KittError::TopicOperation(format!("Failed to get metadata for topic '{topic}': {e}")))?;
 
         let mut cursor = std::io::Cursor::new(response_bytes.as_ref());
         let response_header_version = ApiKey::Metadata.response_header_version(version);
         let _response_header = ResponseHeader::decode(&mut cursor, response_header_version)
-            .map_err(|e| anyhow!("Failed to decode metadata response header: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to decode metadata response header: {e}")))?;
 
         let response = MetadataResponse::decode(&mut cursor, version)
-            .map_err(|e| anyhow!("Failed to decode metadata response: {}", e))?;
+            .map_err(|e| KittError::Protocol(format!("Failed to decode metadata response: {e}")))?;
 
         // Find our topic in the response
         for topic_metadata in response.topics {
@@ -603,7 +607,9 @@ impl KafkaClient {
                         3 => "Unknown topic or partition".to_string(),
                         _ => format!("Kafka error code: {}", topic_metadata.error_code),
                     };
-                    return Err(anyhow!("Topic '{}' not found: {}", topic, error_msg));
+                    return Err(KittError::TopicOperation(format!(
+                        "Topic '{topic}' not found: {error_msg}"
+                    )));
                 }
 
                 let partition_count = topic_metadata.partitions.len() as i32;
@@ -612,7 +618,9 @@ impl KafkaClient {
             }
         }
 
-        Err(anyhow!("Topic '{}' not found in metadata response", topic))
+        Err(KittError::TopicOperation(format!(
+            "Topic '{topic}' not found in metadata response"
+        )))
     }
 }
 

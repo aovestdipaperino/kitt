@@ -9,7 +9,7 @@ use crate::consts::{
     MAX_BACKOFF_MS, MAX_CONSECUTIVE_ERRORS, PARTITION_MAX_BYTES,
 };
 use crate::utils::verify_record_batch_crc;
-use anyhow::Result;
+use crate::error::Result;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use kafka_protocol::messages::fetch_response::FetchResponse;
 use kafka_protocol::messages::{ApiKey, ResponseHeader, TopicName};
