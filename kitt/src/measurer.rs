@@ -48,9 +48,6 @@ impl ThroughputMeasurer {
 
     /// Measures throughput over a specified duration without any visual output (quiet mode)
     ///
-    /// This method collects the same metrics as `measure()` but suppresses all UI output.
-    /// Used with `--quiet` flag for machine-readable output.
-    ///
     /// # Arguments
     /// * `duration` - How long to measure throughput
     /// * `max_backlog` - Maximum backlog threshold for percentage calculation
@@ -75,10 +72,8 @@ impl ThroughputMeasurer {
         let start_time = Instant::now();
         let end_time = start_time + duration;
 
-        // 500ms rate interval for measurement
         let mut rate_interval = interval(Duration::from_millis(500));
 
-        // Baseline counters for rate calculation
         let start_count = if produce_only {
             self.messages_sent.load(Ordering::Relaxed)
         } else {
@@ -87,12 +82,10 @@ impl ThroughputMeasurer {
         let mut last_count = start_count;
         let mut last_rate_time = start_time;
 
-        // Rate tracking
         let mut min_rate = f64::MAX;
         let mut max_rate = 0.0f64;
 
         while bytes_target.is_some() || Instant::now() < end_time {
-            // Check if bytes target reached
             if let Some(target) = bytes_target {
                 if self.bytes_sent.load(Ordering::Relaxed) >= target {
                     break;
@@ -101,7 +94,6 @@ impl ThroughputMeasurer {
 
             rate_interval.tick().await;
 
-            // Calculate instantaneous rate
             let now = Instant::now();
             let current_count = if produce_only {
                 self.messages_sent.load(Ordering::Relaxed)
@@ -113,7 +105,6 @@ impl ThroughputMeasurer {
             if time_elapsed > 0.0 {
                 let current_rate = (current_count - last_count) as f64 / time_elapsed;
 
-                // Skip zero rates to avoid skewing min
                 if current_rate > 0.0 {
                     if min_rate == f64::MAX {
                         min_rate = current_rate;
@@ -123,16 +114,8 @@ impl ThroughputMeasurer {
                     max_rate = max_rate.max(current_rate);
                 }
 
-                // Track backlog percentage (for final average calculation)
                 if !produce_only {
-                    let current_sent = self.messages_sent.load(Ordering::Relaxed);
-                    let current_received = self.messages_received.load(Ordering::Relaxed);
-                    let backlog = current_sent.saturating_sub(current_received);
-                    let backlog_percentage =
-                        (backlog as f64 / max_backlog as f64 * 100.0).min(100.0) as u64;
-                    self.backlog_percentage_sum
-                        .fetch_add(backlog_percentage, Ordering::Relaxed);
-                    self.backlog_measurement_count.fetch_add(1, Ordering::Relaxed);
+                    self.track_backlog_percentage(max_backlog);
                 }
 
                 last_count = current_count;
@@ -149,15 +132,6 @@ impl ThroughputMeasurer {
     /// This method runs two concurrent timers:
     /// 1. Animation timer (100ms) - updates the Knight Rider display
     /// 2. Rate calculation timer (500ms) - calculates current throughput
-    ///
-    /// # Arguments
-    /// * `duration` - How long to measure throughput
-    /// * `label` - Label for display purposes
-    /// * `max_backlog` - Maximum backlog threshold for percentage calculation
-    /// * `fetch_delay` - Initial delay before starting measurement
-    ///
-    /// # Returns
-    /// * `(min_rate, max_rate, elapsed)` - Tuple containing minimum/maximum rates and actual elapsed time
     pub async fn measure(
         &self,
         duration: Duration,
@@ -177,13 +151,9 @@ impl ThroughputMeasurer {
         }
         let start_time = Instant::now();
         let end_time = start_time + duration;
-        // 100ms animation interval provides smooth visual feedback at ~10fps
         let mut animation_interval = interval(Duration::from_millis(100));
-        // 500ms rate interval balances responsiveness vs noise in measurements
         let mut rate_interval = interval(Duration::from_millis(500));
 
-        // Baseline counters for rate calculation
-        // In produce-only mode, track sent messages; otherwise track received
         let start_count = if produce_only {
             self.messages_sent.load(Ordering::Relaxed)
         } else {
@@ -192,6 +162,53 @@ impl ThroughputMeasurer {
         let mut last_count = start_count;
         let mut last_rate_time = start_time;
 
+        Self::log_measurement_start(label, bytes_target, duration);
+        println!(); // Add space for animation
+
+        let _audio_handle = self.animator.start_audio();
+
+        let mut position = 0;
+        let mut direction = 1;
+
+        let mut current_rate = 0.0f64;
+        let mut min_rate = f64::MAX;
+        let mut max_rate = 0.0f64;
+
+        while bytes_target.is_some() || Instant::now() < end_time {
+            if let Some(target) = bytes_target {
+                if self.bytes_sent.load(Ordering::Relaxed) >= target {
+                    break;
+                }
+            }
+
+            select! {
+                _ = animation_interval.tick() => {
+                    position = update_animation_position(position, &mut direction);
+                    let status = self.build_status_string(
+                        produce_only, current_rate, min_rate, max_rate,
+                        max_backlog, start_time,
+                    );
+                    self.animator.draw_frame(position, direction, &status);
+                }
+                _ = rate_interval.tick() => {
+                    let (new_rate, new_min, new_max) = self.calculate_rate(
+                        produce_only, &mut last_count, &mut last_rate_time,
+                        min_rate, max_rate,
+                    );
+                    current_rate = new_rate;
+                    min_rate = new_min;
+                    max_rate = new_max;
+                }
+            }
+        }
+
+        println!(); // New line after animation completes
+        let elapsed = start_time.elapsed();
+        (min_rate, max_rate, elapsed)
+    }
+
+    /// Logs the measurement start message
+    fn log_measurement_start(label: &str, bytes_target: Option<u64>, duration: Duration) {
         if let Some(target) = bytes_target {
             info!(
                 "🚀 Starting {} phase until {} sent",
@@ -205,127 +222,121 @@ impl ThroughputMeasurer {
                 duration.as_secs()
             );
         }
-        println!(); // Add space for animation
+    }
 
-        // Start audio playback for the measurement duration (audio is already configured in constructor)
-        let _audio_handle = self.animator.start_audio();
+    /// Calculates the current rate and updates min/max tracking
+    fn calculate_rate(
+        &self,
+        produce_only: bool,
+        last_count: &mut u64,
+        last_rate_time: &mut Instant,
+        mut min_rate: f64,
+        mut max_rate: f64,
+    ) -> (f64, f64, f64) {
+        let now = Instant::now();
+        let current_count = if produce_only {
+            self.messages_sent.load(Ordering::Relaxed)
+        } else {
+            self.messages_received.load(Ordering::Relaxed)
+        };
+        let time_elapsed = now.duration_since(*last_rate_time).as_secs_f64();
+        let mut current_rate = 0.0;
 
-        // Animation state: position bounces between 0 and LED_BAR_WIDTH
-        let mut position = 0;
-        let mut direction = 1; // 1 = moving right, -1 = moving left
+        if time_elapsed > 0.0 {
+            current_rate = (current_count - *last_count) as f64 / time_elapsed;
 
-        // Rate tracking: min starts at MAX so first valid measurement becomes minimum
-        let mut current_rate = 0.0f64;
-        let mut min_rate = f64::MAX;
-        let mut max_rate = 0.0f64;
-
-        // Main loop uses tokio::select! to run animation and rate calculation concurrently.
-        // This avoids blocking either task while maintaining precise timing for both.
-        while bytes_target.is_some() || Instant::now() < end_time {
-            // Check if bytes target reached (if specified)
-            if let Some(target) = bytes_target {
-                if self.bytes_sent.load(Ordering::Relaxed) >= target {
-                    break;
+            if current_rate > 0.0 {
+                if min_rate == f64::MAX {
+                    min_rate = current_rate;
+                } else {
+                    min_rate = min_rate.min(current_rate);
                 }
+                max_rate = max_rate.max(current_rate);
             }
 
-            select! {
-                _ = animation_interval.tick() => {
-                    // Bounce logic: reverse direction when hitting edges.
-                    // We check LED_MOVEMENT_SPEED from edge to prevent overshooting.
-                    position = if direction > 0 {
-                        if position >= (LED_BAR_WIDTH - LED_MOVEMENT_SPEED) {
-                            direction = -1;
-                            LED_BAR_WIDTH - LED_MOVEMENT_SPEED
-                        } else {
-                            position + LED_MOVEMENT_SPEED
-                        }
-                    } else {
-                        if position < LED_MOVEMENT_SPEED {
-                            direction = 1;
-                            LED_MOVEMENT_SPEED
-                        } else {
-                            position - LED_MOVEMENT_SPEED
-                        }
-                    };
-
-                    // Build status string for display
-                    let status = if produce_only {
-                        // In produce-only mode, show data sent and avg throughput
-                        let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
-                        let elapsed_secs = start_time.elapsed().as_secs_f64();
-                        let avg_mbps = if elapsed_secs > 0.0 {
-                            bytes_sent as f64 / elapsed_secs / (1024.0 * 1024.0)
-                        } else {
-                            0.0
-                        };
-                        format!(
-                            "{:.0} msg/s (min: {:.0}, max: {:.0}, sent: {}, avg: {:.1} MB/s)",
-                            current_rate,
-                            if min_rate > 1e9 { 0.0 } else { min_rate },
-                            max_rate,
-                            format_bytes(bytes_sent),
-                            avg_mbps
-                        )
-                    } else {
-                        // Normal mode: show backlog percentage
-                        let current_sent = self.messages_sent.load(Ordering::Relaxed);
-                        let current_received = self.messages_received.load(Ordering::Relaxed);
-                        let backlog = current_sent.saturating_sub(current_received);
-                        let backlog_percentage = (backlog as f64 / max_backlog as f64 * 100.0).min(100.0);
-
-                        // Track backlog percentage for average calculation
-                        let backlog_percentage_int = backlog_percentage as u64;
-                        self.backlog_percentage_sum.fetch_add(backlog_percentage_int, Ordering::Relaxed);
-                        self.backlog_measurement_count.fetch_add(1, Ordering::Relaxed);
-
-                        format!(
-                            "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: {:.1}%)",
-                            current_rate,
-                            if min_rate > 1e9 { 0.0 } else { min_rate },
-                            max_rate,
-                            backlog_percentage
-                        )
-                    };
-
-                    // Update the visual display with current metrics
-                    self.animator.draw_frame(position, direction, &status);
-                }
-                _ = rate_interval.tick() => {
-                    // Calculate instantaneous rate as delta_messages / delta_time.
-                    // Using deltas instead of cumulative rate gives more responsive feedback.
-                    let now = Instant::now();
-                    let current_count = if produce_only {
-                        self.messages_sent.load(Ordering::Relaxed)
-                    } else {
-                        self.messages_received.load(Ordering::Relaxed)
-                    };
-                    let time_elapsed = now.duration_since(last_rate_time).as_secs_f64();
-
-                    if time_elapsed > 0.0 {
-                        current_rate = (current_count - last_count) as f64 / time_elapsed;
-
-                        // Skip zero rates (e.g., startup) to avoid skewing min
-                        if current_rate > 0.0 {
-                            if min_rate == f64::MAX {
-                                min_rate = current_rate;
-                            } else {
-                                min_rate = min_rate.min(current_rate);
-                            }
-                            max_rate = max_rate.max(current_rate);
-                        }
-
-                        // Slide the measurement window forward
-                        last_count = current_count;
-                        last_rate_time = now;
-                    }
-                }
-            }
+            *last_count = current_count;
+            *last_rate_time = now;
         }
 
-        println!(); // New line after animation completes
-        let elapsed = start_time.elapsed();
-        (min_rate, max_rate, elapsed)
+        (current_rate, min_rate, max_rate)
+    }
+
+    /// Builds the status string for the animation display
+    fn build_status_string(
+        &self,
+        produce_only: bool,
+        current_rate: f64,
+        min_rate: f64,
+        max_rate: f64,
+        max_backlog: u64,
+        start_time: Instant,
+    ) -> String {
+        if produce_only {
+            let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+            let elapsed_secs = start_time.elapsed().as_secs_f64();
+            let avg_mbps = if elapsed_secs > 0.0 {
+                bytes_sent as f64 / elapsed_secs / (1024.0 * 1024.0)
+            } else {
+                0.0
+            };
+            format!(
+                "{:.0} msg/s (min: {:.0}, max: {:.0}, sent: {}, avg: {:.1} MB/s)",
+                current_rate,
+                if min_rate > 1e9 { 0.0 } else { min_rate },
+                max_rate,
+                format_bytes(bytes_sent),
+                avg_mbps
+            )
+        } else {
+            let current_sent = self.messages_sent.load(Ordering::Relaxed);
+            let current_received = self.messages_received.load(Ordering::Relaxed);
+            let backlog = current_sent.saturating_sub(current_received);
+            let backlog_percentage = (backlog as f64 / max_backlog as f64 * 100.0).min(100.0);
+
+            // Track backlog percentage for average calculation
+            let backlog_percentage_int = backlog_percentage as u64;
+            self.backlog_percentage_sum.fetch_add(backlog_percentage_int, Ordering::Relaxed);
+            self.backlog_measurement_count.fetch_add(1, Ordering::Relaxed);
+
+            format!(
+                "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: {:.1}%)",
+                current_rate,
+                if min_rate > 1e9 { 0.0 } else { min_rate },
+                max_rate,
+                backlog_percentage
+            )
+        }
+    }
+
+    /// Tracks backlog percentage for average calculation
+    fn track_backlog_percentage(&self, max_backlog: u64) {
+        let current_sent = self.messages_sent.load(Ordering::Relaxed);
+        let current_received = self.messages_received.load(Ordering::Relaxed);
+        let backlog = current_sent.saturating_sub(current_received);
+        let backlog_percentage =
+            (backlog as f64 / max_backlog as f64 * 100.0).min(100.0) as u64;
+        self.backlog_percentage_sum
+            .fetch_add(backlog_percentage, Ordering::Relaxed);
+        self.backlog_measurement_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Updates the animation position, bouncing between edges
+fn update_animation_position(position: usize, direction: &mut i32) -> usize {
+    if *direction > 0 {
+        if position >= (LED_BAR_WIDTH - LED_MOVEMENT_SPEED) {
+            *direction = -1;
+            LED_BAR_WIDTH - LED_MOVEMENT_SPEED
+        } else {
+            position + LED_MOVEMENT_SPEED
+        }
+    } else {
+        if position < LED_MOVEMENT_SPEED {
+            *direction = 1;
+            LED_MOVEMENT_SPEED
+        } else {
+            position - LED_MOVEMENT_SPEED
+        }
     }
 }
 

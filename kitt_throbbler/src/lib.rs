@@ -441,29 +441,19 @@ impl KnightRiderAnimator {
             duration_secs,
             base_speed_ms,
             max_rate_value,
-            if self.audio_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
+            if self.audio_enabled { "enabled" } else { "disabled" }
         );
         println!("Press Ctrl+C to exit");
 
-        // Start audio loop if enabled
         let audio_control = self.start_audio_loop();
 
         let duration = Duration::from_secs(duration_secs);
         let start = Instant::now();
         let mut position = 0;
         let mut direction = 1;
-
-        // Simulated rate variables
-        let mut rate: f64;
         let mut min_rate: f64 = f64::MAX;
         let mut max_rate: f64 = 0.0;
-        let half_max_rate = max_rate_value / 2.0;
 
-        // Animation pattern options
         let patterns = [
             AnimationPattern::Sine,
             AnimationPattern::Sawtooth,
@@ -475,62 +465,24 @@ impl KnightRiderAnimator {
         let mut pattern_start = start;
 
         while start.elapsed() < duration {
-            // Switch patterns every few seconds
             if pattern_start.elapsed() >= pattern_duration {
                 current_pattern = (current_pattern + 1) % patterns.len();
                 pattern_start = Instant::now();
-                println!(
-                    "\nSwitching to {:?} wave pattern",
-                    patterns[current_pattern]
-                );
+                println!("\nSwitching to {:?} wave pattern", patterns[current_pattern]);
             }
 
-            // Create different wave patterns for the simulated throughput rate
             let elapsed = start.elapsed().as_secs_f64();
             let pattern_progress =
                 pattern_start.elapsed().as_secs_f64() / pattern_duration.as_secs_f64();
 
-            rate = match patterns[current_pattern] {
-                // Sine wave: smooth oscillation
-                AnimationPattern::Sine => half_max_rate + half_max_rate * (elapsed * 0.2).sin(),
+            let rate = calculate_wave_rate(
+                patterns[current_pattern], elapsed, pattern_progress, max_rate_value,
+            );
 
-                // Sawtooth wave: linear ramp up, instant drop
-                AnimationPattern::Sawtooth => {
-                    let saw_val = pattern_progress % 1.0;
-                    saw_val * max_rate_value
-                }
-
-                // Square wave: alternating between min and max
-                AnimationPattern::Square => {
-                    if (elapsed * 0.2).sin() >= 0.0 {
-                        max_rate_value
-                    } else {
-                        max_rate_value * 0.1
-                    }
-                }
-
-                // Pulse wave: occasional spikes
-                AnimationPattern::Pulse => {
-                    let pulse_val = (elapsed * 2.0).sin();
-                    if pulse_val > 0.9 {
-                        max_rate_value
-                    } else {
-                        max_rate_value * 0.2
-                    }
-                }
-            };
-
-            // Update min/max
             min_rate = min_rate.min(rate);
             max_rate = max_rate.max(rate);
 
-            // Update animation position
-            let status = format!(
-                "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: 0.0%)",
-                rate,
-                if min_rate > 1e9 { 0.0 } else { min_rate },
-                max_rate
-            );
+            let status = format_demo_status(rate, min_rate, max_rate);
             self.draw_frame(position, direction, &status);
 
             // Move position and handle direction changes
@@ -541,13 +493,11 @@ impl KnightRiderAnimator {
                 direction = 1;
             }
 
-            // Adjust speed based on simulated rate
             let speed_factor = 1.0 - (rate / max_rate_value).clamp(0.0, 1.0);
             let delay_ms = base_speed_ms + (speed_factor * 80.0) as u64;
             sleep(Duration::from_millis(delay_ms)).await;
         }
 
-        // Stop audio playback
         if let Some((handle, stop_flag)) = audio_control {
             stop_flag.store(true, Ordering::Relaxed);
             let _ = handle.join();
@@ -555,6 +505,48 @@ impl KnightRiderAnimator {
 
         println!("\nAnimation demo completed!");
     }
+}
+
+/// Calculates the simulated rate value based on the wave pattern
+fn calculate_wave_rate(
+    pattern: AnimationPattern,
+    elapsed: f64,
+    pattern_progress: f64,
+    max_rate_value: f64,
+) -> f64 {
+    let half_max_rate = max_rate_value / 2.0;
+    match pattern {
+        AnimationPattern::Sine => half_max_rate + half_max_rate * (elapsed * 0.2).sin(),
+        AnimationPattern::Sawtooth => {
+            let saw_val = pattern_progress % 1.0;
+            saw_val * max_rate_value
+        }
+        AnimationPattern::Square => {
+            if (elapsed * 0.2).sin() >= 0.0 {
+                max_rate_value
+            } else {
+                max_rate_value * 0.1
+            }
+        }
+        AnimationPattern::Pulse => {
+            let pulse_val = (elapsed * 2.0).sin();
+            if pulse_val > 0.9 {
+                max_rate_value
+            } else {
+                max_rate_value * 0.2
+            }
+        }
+    }
+}
+
+/// Formats the demo status string
+fn format_demo_status(rate: f64, min_rate: f64, max_rate: f64) -> String {
+    format!(
+        "{:.0} msg/s (min: {:.0}, max: {:.0}, backlog: 0.0%)",
+        rate,
+        if min_rate > 1e9 { 0.0 } else { min_rate },
+        max_rate
+    )
 }
 
 /// Handle for controlling a running animation

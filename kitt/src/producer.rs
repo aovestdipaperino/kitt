@@ -70,17 +70,6 @@ pub struct Producer {
 
 impl Producer {
     /// Creates a new Producer instance
-    ///
-    /// # Arguments
-    /// * `client` - Shared Kafka client for network communication
-    /// * `topic` - Target topic name for message production
-    /// * `producer_partitions_per_thread` - Number of partitions to send to per batch
-    /// * `total_partitions` - Total number of partitions available for random selection
-    /// * `message_size` - Size configuration for generated messages
-    /// * `thread_id` - Unique identifier for this producer thread
-    /// * `use_sticky_partitions` - Whether to use sticky partition assignment
-    /// * `key_strategy` - Strategy for generating message keys
-    /// * `messages_per_batch` - Number of messages to include in each record batch
     #[expect(clippy::too_many_arguments, reason = "Producer configuration requires multiple parameters")]
     pub fn new(
         client: Arc<KafkaClient>,
@@ -107,18 +96,6 @@ impl Producer {
     }
 
     /// Produces messages continuously for the specified duration
-    ///
-    /// This method implements the core message production loop with:
-    /// - Partition selection (either sticky assignment or random based on configuration)
-    /// - Backpressure control to prevent memory exhaustion
-    /// - High-throughput batch processing
-    ///
-    /// # Arguments
-    /// * `config` - Configuration for message production including duration, counters, and options
-    ///
-    /// # Returns
-    /// * `Ok(())` - When production completes successfully
-    /// * `Err(anyhow::Error)` - If Kafka communication or encoding fails
     pub async fn produce_messages(&self, config: ProduceConfig) -> Result<()> {
         let ProduceConfig {
             duration,
@@ -131,263 +108,59 @@ impl Producer {
         } = config;
         let end_time = Instant::now() + duration;
 
-        // Determine partition selection strategy based on configuration
         let partition_count = self.producer_partitions_per_thread as usize;
         let start_partition = if self.use_sticky_partitions {
             self.thread_id * self.producer_partitions_per_thread as usize
         } else {
-            0 // Not used in random mode
+            0
         };
 
         let mut pending_futures = Vec::new();
-
-        // Retry logic: give up after MAX_CONSECUTIVE_ERRORS with exponential backoff
         let mut consecutive_errors: u32 = 0;
 
-        // When bytes_target is specified, ignore time limit and run until target is reached
         while bytes_target.is_some() || Instant::now() < end_time {
-            // Check if we've reached the bytes target (if specified)
             if let Some(target) = bytes_target {
                 if bytes_sent.load(Ordering::Relaxed) >= target {
                     break;
                 }
             }
 
-            // Implement backpressure control to prevent memory exhaustion
+            // Implement backpressure control
             let sent = messages_sent.load(Ordering::Relaxed);
             let received = messages_received.load(Ordering::Relaxed);
             let backlog = sent.saturating_sub(received);
 
             if backlog > max_backlog {
-                // Backpressure: pause producer when consumer falls behind to prevent unbounded
-                // memory growth. 10ms is short enough to maintain throughput when consumer recovers.
                 profile!(KittOperation::BacklogWaiting, {
                     tokio::time::sleep(Duration::from_millis(BACKPRESSURE_PAUSE_MS)).await;
                 });
                 continue;
             }
 
-            // Create produce request with 1 message per partition
-            let mut request = ProduceRequest::default();
-            // acks=-1 (all): wait for all replicas. Strongest durability guarantee.
-            request.acks = -1;
-            request.timeout_ms = PRODUCE_TIMEOUT_MS;
+            // Build and send produce request
+            let (request, total_bytes_in_request) = self.build_produce_request(
+                partition_count,
+                start_partition,
+            )?;
 
-            let mut topic_data = TopicProduceData::default();
-            topic_data.name = TopicName(StrBytes::from_string(self.topic.clone()));
-
-            // Configure encoding options for the record batch
-            let options = RecordEncodeOptions {
-                version: 2,
-                compression: Compression::None,
-            };
-
-            // Track total bytes for this request
-            let mut total_bytes_in_request: u64 = 0;
-
-            // Create one message for each partition based on assignment strategy
-            for i in 0..partition_count {
-                let partition_id = if self.use_sticky_partitions {
-                    // Sticky mode: each thread has fixed partitions
-                    (start_partition + i) as i32
-                } else {
-                    // Random mode: select random partition for each message
-                    if self.total_partitions > 0 {
-                        (rand::random::<u32>() % self.total_partitions as u32) as i32
-                    } else {
-                        error!(
-                            "Producer thread {} has invalid total_partitions: {}",
-                            self.thread_id, self.total_partitions
-                        );
-                        continue;
-                    }
-                };
-
-                // Validate partition ID is within valid range (defensive programming)
-                if partition_id < 0 || partition_id >= self.total_partitions {
-                    error!(
-                        "Producer thread {} generated invalid partition ID {} (valid range: 0-{})",
-                        self.thread_id,
-                        partition_id,
-                        self.total_partitions - 1
-                    );
-                    continue; // Skip this partition and try next iteration
-                }
-
-                debug!(
-                    "Producer thread {} {} partition {} (total partitions: {})",
-                    self.thread_id,
-                    if self.use_sticky_partitions {
-                        "assigned"
-                    } else {
-                        "selecting"
-                    },
-                    partition_id,
-                    self.total_partitions
-                );
-
-                // Create multiple records for this partition's batch
-                let mut records = Vec::with_capacity(self.messages_per_batch);
-                for _ in 0..self.messages_per_batch {
-                    // Generate message with configured size
-                    let size = profile!(KittOperation::MessageSizeGeneration, {
-                        self.message_size.generate_size()
-                    });
-                    total_bytes_in_request += size as u64;
-                    let payload = vec![b'x'; size];
-                    let timestamp =
-                        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-
-                    // Generate message key based on configured strategy (different key for each message)
-                    let key = self.key_strategy.generate_key();
-
-                    // Idempotence is disabled (producer_id=-1) because multiple threads would need
-                    // coordinated sequence numbers, which adds complexity without benefit for throughput testing.
-                    records.push(Record {
-                        transactional: false,
-                        control: false,
-                        partition_leader_epoch: 0,
-                        producer_id: -1,  // -1 disables idempotence
-                        producer_epoch: -1,
-                        timestamp_type: TimestampType::Creation,
-                        offset: 0,    // Broker assigns actual offset; 0 is placeholder
-                        sequence: -1, // Required when idempotence disabled
-                        timestamp,
-                        key,
-                        value: Some(Bytes::from(payload)),
-                        headers: indexmap::IndexMap::new(),
-                    });
-                }
-
-                // Encode all records into a single batch
-                let mut batch_buf = bytes::BytesMut::new();
-                RecordBatchEncoder::encode(
-                    &mut batch_buf,
-                    records.iter().collect::<Vec<_>>(),
-                    &options,
-                )?;
-                let batch = batch_buf.freeze();
-
-                // Create partition data
-                let mut partition_data = PartitionProduceData::default();
-                partition_data.index = partition_id;
-                partition_data.records = Some(batch);
-                topic_data.partition_data.push(partition_data);
-            }
-
-            request.topic_data.push(topic_data);
-
-            // Send the batched request asynchronously.
-            // Messages are counted AFTER the server acknowledges, not before,
-            // to prevent inflated backlog from eagerly-counted but not-yet-sent messages.
-            let version = self.client.get_supported_version(ApiKey::Produce, 3);
-            let client = self.client.clone();
-            let thread_id = self.thread_id;
-            let msg_count = partition_count as u64 * self.messages_per_batch as u64;
-            let byte_count = total_bytes_in_request;
-            let msgs_sent = messages_sent.clone();
-            let bts_sent = bytes_sent.clone();
-            let future = tokio::spawn(async move {
-                debug!(
-                    "Producer thread {} sending batch with {} partitions, producer_id=-1 (idempotence disabled)",
-                    thread_id,
-                    partition_count
-                );
-                match profile!(KittOperation::MessageProduce, {
-                    client.send_request(ApiKey::Produce, &request, version)
-                })
-                .await
-                {
-                    Ok(response_bytes) => {
-                        // Count messages only after server acknowledges
-                        msgs_sent.fetch_add(msg_count, Ordering::Relaxed);
-                        bts_sent.fetch_add(byte_count, Ordering::Relaxed);
-                        // Validate the produce response if enabled
-                        if message_validation {
-                            profile!(KittOperation::ResponseValidation, {
-                                kitt_core::Producer::validate_produce_response(
-                                    &response_bytes,
-                                    version,
-                                    thread_id,
-                                    partition_count,
-                                )
-                            })
-                            .await?;
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!(
-                            "Producer thread {} PRODUCE REQUEST FAILED: {}",
-                            thread_id, e
-                        );
-
-                        // Provide specific troubleshooting guidance
-                        let error_str = e.to_string().to_lowercase();
-                        if error_str.contains("connection") || error_str.contains("network") {
-                            error!("NETWORK ISSUE - Check broker connectivity and network configuration");
-                        } else if error_str.contains("timeout") {
-                            error!("TIMEOUT - Broker may be overloaded or network latency high");
-                        } else if error_str.contains("auth") || error_str.contains("permission") {
-                            error!(
-                                "AUTHENTICATION - Verify credentials and ACLs for this broker"
-                            );
-                        } else if error_str.contains("protocol") || error_str.contains("version") {
-                            error!("PROTOCOL MISMATCH - Broker may use different Kafka version/protocol");
-                        } else {
-                            error!("UNKNOWN ERROR - Check broker logs and configuration");
-                        }
-
-                        Err(e)
-                    }
-                }
-            });
+            let future = self.spawn_produce_task(
+                request,
+                partition_count,
+                total_bytes_in_request,
+                &messages_sent,
+                &bytes_sent,
+                message_validation,
+            );
             pending_futures.push(future);
 
-            // Drain completed futures; block when at capacity to bound in-flight requests.
-            if pending_futures.len() >= MAX_PENDING_REQUESTS {
-                // First pass: reap any already-completed futures
-                let mut i = 0;
-                while i < pending_futures.len() {
-                    if pending_futures[i].is_finished() {
-                        let result = pending_futures.remove(i).await;
-                        match result {
-                            Ok(Ok(_)) => {
-                                consecutive_errors = 0;
-                            }
-                            Ok(Err(e)) => {
-                                consecutive_errors += 1;
-                                debug!("Producer validation failed: {}", e);
-                            }
-                            Err(e) => {
-                                consecutive_errors += 1;
-                                debug!("Failed to send batch: {}", e);
-                            }
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                // If still at capacity, await the oldest request to prevent unbounded growth
-                if pending_futures.len() >= MAX_PENDING_REQUESTS {
-                    let result = pending_futures.remove(0).await;
-                    match result {
-                        Ok(Ok(_)) => {
-                            consecutive_errors = 0;
-                        }
-                        Ok(Err(e)) => {
-                            consecutive_errors += 1;
-                            debug!("Producer validation failed: {}", e);
-                        }
-                        Err(e) => {
-                            consecutive_errors += 1;
-                            debug!("Failed to send batch: {}", e);
-                        }
-                    }
-                }
-            }
+            // Drain completed futures
+            drain_pending_futures(
+                &mut pending_futures,
+                &mut consecutive_errors,
+            )
+            .await;
 
-            // Check consecutive errors and apply exponential backoff or give up
+            // Check consecutive errors and apply backoff
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                 error!(
                     "Producer thread {}: giving up after {} consecutive errors",
@@ -406,21 +179,260 @@ impl Producer {
         }
 
         // Clean up: wait for all remaining requests to complete
-        for future in pending_futures {
-            match future.await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    debug!("Producer validation failed: {}", e);
-                }
-                Err(e) => {
-                    debug!("Failed to complete pending batch: {}", e);
-                }
-            }
-        }
+        drain_remaining_futures(pending_futures).await;
 
         Ok(())
     }
 
+    /// Builds a produce request with batched records for all assigned partitions
+    fn build_produce_request(
+        &self,
+        partition_count: usize,
+        start_partition: usize,
+    ) -> Result<(ProduceRequest, u64)> {
+        let mut request = ProduceRequest::default();
+        request.acks = -1;
+        request.timeout_ms = PRODUCE_TIMEOUT_MS;
+
+        let mut topic_data = TopicProduceData::default();
+        topic_data.name = TopicName(StrBytes::from_string(self.topic.clone()));
+
+        let options = RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        };
+
+        let mut total_bytes_in_request: u64 = 0;
+
+        for i in 0..partition_count {
+            let partition_id = self.select_partition(i, start_partition);
+
+            if partition_id < 0 || partition_id >= self.total_partitions {
+                error!(
+                    "Producer thread {} generated invalid partition ID {} (valid range: 0-{})",
+                    self.thread_id, partition_id, self.total_partitions - 1
+                );
+                continue;
+            }
+
+            debug!(
+                "Producer thread {} {} partition {} (total partitions: {})",
+                self.thread_id,
+                if self.use_sticky_partitions { "assigned" } else { "selecting" },
+                partition_id,
+                self.total_partitions
+            );
+
+            let (partition_data, bytes) = self.build_partition_batch(partition_id, &options)?;
+            total_bytes_in_request += bytes;
+            topic_data.partition_data.push(partition_data);
+        }
+
+        request.topic_data.push(topic_data);
+        Ok((request, total_bytes_in_request))
+    }
+
+    /// Selects a partition ID based on the configured strategy
+    fn select_partition(&self, index: usize, start_partition: usize) -> i32 {
+        if self.use_sticky_partitions {
+            (start_partition + index) as i32
+        } else {
+            if self.total_partitions > 0 {
+                (rand::random::<u32>() % self.total_partitions as u32) as i32
+            } else {
+                error!(
+                    "Producer thread {} has invalid total_partitions: {}",
+                    self.thread_id, self.total_partitions
+                );
+                -1 // Will be caught by validation
+            }
+        }
+    }
+
+    /// Builds a batch of records for a single partition
+    fn build_partition_batch(
+        &self,
+        partition_id: i32,
+        options: &RecordEncodeOptions,
+    ) -> Result<(PartitionProduceData, u64)> {
+        let mut records = Vec::with_capacity(self.messages_per_batch);
+        let mut total_bytes = 0u64;
+
+        for _ in 0..self.messages_per_batch {
+            let size = profile!(KittOperation::MessageSizeGeneration, {
+                self.message_size.generate_size()
+            });
+            total_bytes += size as u64;
+            let payload = vec![b'x'; size];
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+            let key = self.key_strategy.generate_key();
+
+            records.push(Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                timestamp_type: TimestampType::Creation,
+                offset: 0,
+                sequence: -1,
+                timestamp,
+                key,
+                value: Some(Bytes::from(payload)),
+                headers: indexmap::IndexMap::new(),
+            });
+        }
+
+        let mut batch_buf = bytes::BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut batch_buf,
+            records.iter().collect::<Vec<_>>(),
+            options,
+        )?;
+        let batch = batch_buf.freeze();
+
+        let mut partition_data = PartitionProduceData::default();
+        partition_data.index = partition_id;
+        partition_data.records = Some(batch);
+
+        Ok((partition_data, total_bytes))
+    }
+
+    /// Spawns a tokio task to send a produce request
+    fn spawn_produce_task(
+        &self,
+        request: ProduceRequest,
+        partition_count: usize,
+        total_bytes_in_request: u64,
+        messages_sent: &Arc<AtomicU64>,
+        bytes_sent: &Arc<AtomicU64>,
+        message_validation: bool,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let version = self.client.get_supported_version(ApiKey::Produce, 3);
+        let client = self.client.clone();
+        let thread_id = self.thread_id;
+        let msg_count = partition_count as u64 * self.messages_per_batch as u64;
+        let byte_count = total_bytes_in_request;
+        let msgs_sent = messages_sent.clone();
+        let bts_sent = bytes_sent.clone();
+
+        tokio::spawn(async move {
+            debug!(
+                "Producer thread {} sending batch with {} partitions, producer_id=-1 (idempotence disabled)",
+                thread_id, partition_count
+            );
+            let send_result = profile!(KittOperation::MessageProduce, {
+                client.send_request(ApiKey::Produce, &request, version)
+            })
+            .await;
+            match send_result {
+                Ok(response_bytes) => {
+                    msgs_sent.fetch_add(msg_count, Ordering::Relaxed);
+                    bts_sent.fetch_add(byte_count, Ordering::Relaxed);
+                    if message_validation {
+                        profile!(KittOperation::ResponseValidation, {
+                            kitt_core::Producer::validate_produce_response(
+                                &response_bytes,
+                                version,
+                                thread_id,
+                                partition_count,
+                            )
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    log_produce_request_error(thread_id, &e);
+                    Err(anyhow::anyhow!("{}", e))
+                }
+            }
+        })
+    }
+}
+
+/// Logs a produce request error with troubleshooting guidance
+fn log_produce_request_error(thread_id: usize, err: &impl std::fmt::Display) {
+    error!(
+        "Producer thread {} PRODUCE REQUEST FAILED: {}",
+        thread_id, err
+    );
+
+    let error_str = err.to_string().to_lowercase();
+    if error_str.contains("connection") || error_str.contains("network") {
+        error!("NETWORK ISSUE - Check broker connectivity and network configuration");
+    } else if error_str.contains("timeout") {
+        error!("TIMEOUT - Broker may be overloaded or network latency high");
+    } else if error_str.contains("auth") || error_str.contains("permission") {
+        error!("AUTHENTICATION - Verify credentials and ACLs for this broker");
+    } else if error_str.contains("protocol") || error_str.contains("version") {
+        error!("PROTOCOL MISMATCH - Broker may use different Kafka version/protocol");
+    } else {
+        error!("UNKNOWN ERROR - Check broker logs and configuration");
+    }
+}
+
+/// Drains completed futures from the pending list, blocking if at capacity
+async fn drain_pending_futures(
+    pending_futures: &mut Vec<tokio::task::JoinHandle<Result<()>>>,
+    consecutive_errors: &mut u32,
+) {
+    if pending_futures.len() < MAX_PENDING_REQUESTS {
+        return;
+    }
+
+    // First pass: reap any already-completed futures
+    let mut i = 0;
+    while i < pending_futures.len() {
+        if pending_futures[i].is_finished() {
+            let result = pending_futures.remove(i).await;
+            handle_future_result(result, consecutive_errors);
+        } else {
+            i += 1;
+        }
+    }
+
+    // If still at capacity, await the oldest request
+    if pending_futures.len() >= MAX_PENDING_REQUESTS {
+        let result = pending_futures.remove(0).await;
+        handle_future_result(result, consecutive_errors);
+    }
+}
+
+/// Handles the result of a completed produce future
+fn handle_future_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    consecutive_errors: &mut u32,
+) {
+    match result {
+        Ok(Ok(_)) => {
+            *consecutive_errors = 0;
+        }
+        Ok(Err(e)) => {
+            *consecutive_errors += 1;
+            debug!("Producer validation failed: {}", e);
+        }
+        Err(e) => {
+            *consecutive_errors += 1;
+            debug!("Failed to send batch: {}", e);
+        }
+    }
+}
+
+/// Waits for all remaining pending futures to complete
+async fn drain_remaining_futures(pending_futures: Vec<tokio::task::JoinHandle<Result<()>>>) {
+    for future in pending_futures {
+        match future.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                debug!("Producer validation failed: {}", e);
+            }
+            Err(e) => {
+                debug!("Failed to complete pending batch: {}", e);
+            }
+        }
+    }
 }
 
 /// Delegates to kitt_core's produce response validation test

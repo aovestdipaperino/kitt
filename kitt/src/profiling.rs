@@ -51,10 +51,7 @@ pub fn generate_report() {
     let all_stats = ProfileCollector::get_all_stats();
 
     if all_stats.is_empty() {
-        println!("\n🚀 KITT Performance Profile Report");
-        println!("=====================================\n");
-        println!("No profiling data collected (profiling may be disabled).");
-        println!("To enable full profiling, compile with --features full\n");
+        print_empty_report();
         return;
     }
 
@@ -68,7 +65,6 @@ pub fn generate_report() {
     println!("{}", "─".repeat(50));
     println!();
 
-    // Then provide our enhanced analysis
     // Sort operations by total time spent
     let mut operations: Vec<_> = all_stats.iter().collect();
     operations.sort_by(|a, b| {
@@ -77,6 +73,32 @@ pub fn generate_report() {
         b_total.cmp(&a_total)
     });
 
+    let total_time_micros: u64 = operations
+        .iter()
+        .map(|(_, stats)| stats.total.as_micros() as u64)
+        .sum();
+
+    print_operation_table(&operations, total_time_micros);
+    add_percentile_analysis(&operations);
+    print_performance_insights(&operations, total_time_micros);
+    print_category_analysis(&operations, total_time_micros);
+    print_recommendations(&operations);
+    print_summary_statistics();
+}
+
+/// Prints an empty report when no profiling data is collected
+fn print_empty_report() {
+    println!("\n🚀 KITT Performance Profile Report");
+    println!("=====================================\n");
+    println!("No profiling data collected (profiling may be disabled).");
+    println!("To enable full profiling, compile with --features full\n");
+}
+
+/// Prints the main operation table
+fn print_operation_table(
+    operations: &[(&String, &quantum_pulse::collector::OperationStats)],
+    total_time_micros: u64,
+) {
     println!("📊 Enhanced Analysis:");
     println!(
         "{:<35} {:>10} {:>12} {:>12} {:>12} {:>10}",
@@ -84,13 +106,7 @@ pub fn generate_report() {
     );
     println!("{}", "=".repeat(95));
 
-    // First calculate total time for percentage calculations
-    let total_time_micros: u64 = operations
-        .iter()
-        .map(|(_, stats)| stats.total.as_micros() as u64)
-        .sum();
-
-    for (operation_name, stats) in &operations {
+    for (operation_name, stats) in operations {
         let total_micros = stats.total.as_micros() as u64;
         let total_ms = total_micros as f64 / 1000.0;
         let avg_us = if stats.count > 0 {
@@ -105,7 +121,6 @@ pub fn generate_report() {
             0.0
         };
 
-        // Truncate long operation names for better alignment
         let display_name = if operation_name.len() > 34 {
             format!("{}...", &operation_name[..31])
         } else {
@@ -133,11 +148,13 @@ pub fn generate_report() {
         "",
         "100.0%"
     );
+}
 
-    // Add percentile analysis for operations with significant samples
-    add_percentile_analysis(&operations);
-
-    // Performance insights
+/// Prints performance insights based on the collected data
+fn print_performance_insights(
+    operations: &[(&String, &quantum_pulse::collector::OperationStats)],
+    total_time_micros: u64,
+) {
     println!("\n🔍 Performance Insights:");
 
     if let Some((slowest_op, slowest_stats)) = operations.first() {
@@ -153,19 +170,22 @@ pub fn generate_report() {
     }
 
     // Find operations with high variance (max >> avg)
-    for (_operation_name, stats) in &operations {
+    for (_operation_name, stats) in operations {
         if stats.count > 1 {
-            let total_micros = stats.total.as_micros() as u64;
-            let _avg_us = total_micros / stats.count as u64;
+            let _total_micros = stats.total.as_micros() as u64;
             // Note: In stub mode, we don't have max duration info
-            // This analysis would be more meaningful with the "full" feature enabled
         }
     }
+}
 
-    // Category-based analysis
+/// Prints time breakdown by category
+fn print_category_analysis(
+    operations: &[(&String, &quantum_pulse::collector::OperationStats)],
+    total_time_micros: u64,
+) {
     let mut category_totals: HashMap<&str, u64> = HashMap::new();
 
-    for (operation_name, stats) in &operations {
+    for (operation_name, stats) in operations {
         let category = if operation_name.contains("Producer") {
             "Producer"
         } else if operation_name.contains("Consumer") {
@@ -196,10 +216,14 @@ pub fn generate_report() {
             );
         }
     }
+}
 
+/// Prints performance recommendations based on collected data
+fn print_recommendations(
+    operations: &[(&String, &quantum_pulse::collector::OperationStats)],
+) {
     println!("\n📈 Recommendations:");
 
-    // Performance recommendations based on the data
     if let Some((slowest_op, _)) = operations.first() {
         if slowest_op.contains("MessageProduce") {
             println!("• Consider batching messages or adjusting producer configuration");
@@ -212,8 +236,7 @@ pub fn generate_report() {
         }
     }
 
-    // Check for backlog waiting issues
-    for (operation_name, stats) in &operations {
+    for (operation_name, stats) in operations {
         if operation_name.contains("BacklogWaiting") && stats.total.as_millis() > 100 {
             println!(
                 "• Significant backlog waiting time detected ({:.1}ms total) - producers are being throttled",
@@ -221,7 +244,10 @@ pub fn generate_report() {
             );
         }
     }
+}
 
+/// Prints summary statistics from the profiler
+fn print_summary_statistics() {
     let summary = ProfileCollector::get_summary();
     println!("\n📊 Summary Statistics:");
     println!("• Total operations: {}", summary.total_operations);
@@ -240,17 +266,25 @@ pub fn generate_report() {
 
 /// Add percentile analysis for operations with sufficient sample sizes
 fn add_percentile_analysis(operations: &[(&String, &quantum_pulse::collector::OperationStats)]) {
-    // Filter operations with enough samples for meaningful percentile analysis
     let significant_ops: Vec<_> = operations
         .iter()
         .filter(|(_, stats)| stats.count >= 10)
-        .take(10) // Show top 10 operations by sample count
+        .take(10)
         .collect();
 
     if significant_ops.is_empty() {
         return;
     }
 
+    print_percentile_table(&significant_ops);
+    add_variance_insights(&significant_ops);
+    print_percentile_interpretation();
+}
+
+/// Prints the percentile analysis table
+fn print_percentile_table(
+    operations: &[&(&String, &quantum_pulse::collector::OperationStats)],
+) {
     println!("\n📈 Percentile Analysis (Operations with 10+ samples):");
     println!("{}", "─".repeat(95));
     println!(
@@ -259,14 +293,13 @@ fn add_percentile_analysis(operations: &[(&String, &quantum_pulse::collector::Op
     );
     println!("{}", "─".repeat(95));
 
-    for (operation_name, stats) in &significant_ops {
+    for (operation_name, stats) in operations {
         let display_name = if operation_name.len() > 29 {
             format!("{}...", &operation_name[..26])
         } else {
             operation_name.to_string()
         };
 
-        // Calculate estimated percentiles based on operation characteristics
         let mean_micros = stats.mean().as_micros() as u64;
         let (p50, p95, p99, variance_category, quality_score) =
             estimate_percentiles_enhanced(operation_name, mean_micros, stats.count);
@@ -287,11 +320,10 @@ fn add_percentile_analysis(operations: &[(&String, &quantum_pulse::collector::Op
     println!("📝 Note: Percentiles are estimated using operation characteristics and distribution models.");
     println!("   Variance: Low=consistent, Med=variable, High=unpredictable performance");
     println!("   Quality: A=excellent, B=good, C=acceptable, D=needs attention");
+}
 
-    // Add performance variance insights
-    add_variance_insights(&significant_ops);
-
-    // Add interpretation guide
+/// Prints the percentile interpretation guide
+fn print_percentile_interpretation() {
     println!("\n💡 Percentile Interpretation:");
     println!("   • P50 (median): 50% of operations complete faster than this");
     println!("   • P95: 95% of operations complete faster than this");
@@ -306,47 +338,40 @@ fn estimate_percentiles_enhanced(
     mean_micros: u64,
     sample_count: usize,
 ) -> (u64, u64, u64, &'static str, &'static str) {
-    // Determine operation characteristics based on name patterns
     let (base_factors, variance_category) =
         if operation_name.contains("MessageProduce") || operation_name.contains("MessageConsume") {
-            // Message operations are typically consistent but can have outliers
             ((0.85, 2.0, 3.2), "Med")
         } else if operation_name.contains("Processing")
             || operation_name.contains("MessageSizeGeneration")
         {
-            // Processing operations are usually very consistent
             ((0.92, 1.5, 2.1), "Low")
         } else if operation_name.contains("BacklogWaiting") {
-            // Backlog waiting can have high variance depending on system state
             ((0.60, 3.5, 6.0), "High")
         } else {
-            // Default case for validation and other operations
             ((0.85, 2.0, 3.2), "Med")
         };
 
-    // Adjust based on sample count (more samples = better distribution estimates)
     let sample_adjustment = if sample_count > 1000 {
-        (1.0, 0.9, 0.85) // Tighter distribution with many samples
+        (1.0, 0.9, 0.85)
     } else if sample_count > 100 {
-        (1.0, 1.0, 1.0) // Normal distribution
+        (1.0, 1.0, 1.0)
     } else {
-        (1.0, 1.1, 1.2) // Wider distribution with fewer samples
+        (1.0, 1.1, 1.2)
     };
 
     let p50 = (mean_micros as f64 * base_factors.0 * sample_adjustment.0) as u64;
     let p95 = (mean_micros as f64 * base_factors.1 * sample_adjustment.1) as u64;
     let p99 = (mean_micros as f64 * base_factors.2 * sample_adjustment.2) as u64;
 
-    // Calculate quality score based on P99/P50 ratio and absolute performance
     let p99_p50_ratio = p99 as f64 / p50 as f64;
     let quality_score = if p99_p50_ratio < 2.0 && mean_micros < 1000 {
-        "A" // Excellent: low variance and fast
+        "A"
     } else if p99_p50_ratio < 3.0 && mean_micros < 5000 {
-        "B" // Good: acceptable variance and performance
+        "B"
     } else if p99_p50_ratio < 4.0 && mean_micros < 20000 {
-        "C" // Acceptable: higher variance or slower performance
+        "C"
     } else {
-        "D" // Needs attention: high variance or slow performance
+        "D"
     };
 
     (p50, p95, p99, variance_category, quality_score)

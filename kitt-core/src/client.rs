@@ -455,113 +455,16 @@ impl KafkaClient {
     pub async fn delete_topic(&self, topic: &str) -> Result<()> {
         debug!("Deleting topic '{}'", topic);
 
-        // Build DeleteTopics request
-        let mut request = DeleteTopicsRequest::default();
-        request.timeout_ms = TOPIC_OPERATION_TIMEOUT_MS;
-
-        // FORCE version 1 to eliminate any version negotiation issues
-        // Version 1 is widely supported and uses the simple topic_names field
+        let request = build_delete_topic_request(topic)?;
         let version = 1i16;
-
-        debug!(
-            "Using DeleteTopics API version {} (forced to avoid '0 topics' issue)",
-            version
-        );
-
-        // All versions 0-5 use the topic_names field
-        request
-            .topic_names
-            .push(TopicName(StrBytes::from_string(topic.to_string())));
-
-        debug!(
-            "DeleteTopics request prepared: version={}, timeout_ms={}, topic_names.len()={}",
-            version,
-            request.timeout_ms,
-            request.topic_names.len()
-        );
-
-        // CRITICAL VERIFICATION: Ensure topic_names is populated before sending
-        if request.topic_names.is_empty() {
-            return Err(KittError::TopicOperation(
-                "FATAL: topic_names field is empty - this would cause '0 topics' error".to_string(),
-            ));
-        }
-
-        debug!(
-            "Sending DeleteTopics request: version={}, topic_names=[{}], timeout_ms={}",
-            version,
-            request
-                .topic_names
-                .iter()
-                .map(|t| t.0.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            request.timeout_ms
-        );
 
         let response_bytes = self
             .send_request(ApiKey::DeleteTopics, &request, version)
             .await
             .map_err(|e| KittError::TopicOperation(format!("Failed to delete topic '{topic}': {e}")))?;
 
-        // Parse response to check for errors
-        let mut cursor = std::io::Cursor::new(response_bytes.as_ref());
-
-        // Decode response header
-        let response_header_version = ApiKey::DeleteTopics.response_header_version(version);
-        let _response_header = ResponseHeader::decode(&mut cursor, response_header_version)
-            .map_err(|e| KittError::Protocol(format!("Failed to decode response header: {e}")))?;
-
-        // Decode delete topics response
-        let response = DeleteTopicsResponse::decode(&mut cursor, version)
-            .map_err(|e| KittError::Protocol(format!("Failed to decode delete topics response: {e}")))?;
-
-        // Check for errors in the response
-        let response_count = response.responses.len();
-        debug!(
-            "Received delete topics response with {} results",
-            response_count
-        );
-
-        for topic_result in response.responses {
-            let topic_name = match &topic_result.name {
-                Some(name) => name.0.as_str(),
-                None => {
-                    warn!("Received topic result with no name field");
-                    continue;
-                }
-            };
-
-            debug!(
-                "Processing delete result for topic '{}' with error code {}",
-                topic_name, topic_result.error_code
-            );
-
-            if topic_name == topic {
-                if topic_result.error_code != 0 {
-                    let error_msg = match topic_result.error_code {
-                        3 => "Unknown topic or partition".to_string(),
-                        5 => "Leader not available".to_string(),
-                        29 => "Topic authorization failed".to_string(),
-                        31 => "Invalid topic exception".to_string(),
-                        36 => "Not controller".to_string(),
-                        60 => "Topic deletion disabled".to_string(),
-                        65 => "Unknown server error".to_string(),
-                        _ => format!("Unknown Kafka error code: {}", topic_result.error_code),
-                    };
-                    return Err(KittError::TopicOperation(format!(
-                        "Failed to delete topic '{topic}': {error_msg}"
-                    )));
-                }
-                info!("Successfully deleted topic '{}'", topic);
-                return Ok(());
-            }
-        }
-
-        // Topic not found in response - this shouldn't normally happen
-        Err(KittError::TopicOperation(format!(
-            "Topic '{topic}' not found in delete response (received {response_count} topics in response)"
-        )))
+        let response = decode_delete_response(&response_bytes, version)?;
+        check_delete_response(response, topic)
     }
 
     /// Gets metadata for an existing topic
@@ -622,6 +525,102 @@ impl KafkaClient {
             "Topic '{topic}' not found in metadata response"
         )))
     }
+}
+
+/// Builds a DeleteTopics request for the given topic name
+fn build_delete_topic_request(topic: &str) -> Result<DeleteTopicsRequest> {
+    let mut request = DeleteTopicsRequest::default();
+    request.timeout_ms = TOPIC_OPERATION_TIMEOUT_MS;
+
+    request
+        .topic_names
+        .push(TopicName(StrBytes::from_string(topic.to_string())));
+
+    debug!(
+        "DeleteTopics request prepared: version=1, timeout_ms={}, topic_names.len()={}",
+        request.timeout_ms,
+        request.topic_names.len()
+    );
+
+    if request.topic_names.is_empty() {
+        return Err(KittError::TopicOperation(
+            "FATAL: topic_names field is empty - this would cause '0 topics' error".to_string(),
+        ));
+    }
+
+    Ok(request)
+}
+
+/// Decodes the delete topics response from raw bytes
+fn decode_delete_response(
+    response_bytes: &Bytes,
+    version: i16,
+) -> Result<DeleteTopicsResponse> {
+    let mut cursor = std::io::Cursor::new(response_bytes.as_ref());
+
+    let response_header_version = ApiKey::DeleteTopics.response_header_version(version);
+    let _response_header = ResponseHeader::decode(&mut cursor, response_header_version)
+        .map_err(|e| KittError::Protocol(format!("Failed to decode response header: {e}")))?;
+
+    DeleteTopicsResponse::decode(&mut cursor, version)
+        .map_err(|e| KittError::Protocol(format!("Failed to decode delete topics response: {e}")))
+}
+
+/// Checks the delete response for errors and returns the appropriate result
+fn check_delete_response(
+    response: DeleteTopicsResponse,
+    topic: &str,
+) -> Result<()> {
+    let response_count = response.responses.len();
+    debug!(
+        "Received delete topics response with {} results",
+        response_count
+    );
+
+    for topic_result in response.responses {
+        let topic_name = match &topic_result.name {
+            Some(name) => name.0.as_str(),
+            None => {
+                warn!("Received topic result with no name field");
+                continue;
+            }
+        };
+
+        debug!(
+            "Processing delete result for topic '{}' with error code {}",
+            topic_name, topic_result.error_code
+        );
+
+        if topic_name == topic {
+            return validate_delete_error_code(topic, topic_result.error_code);
+        }
+    }
+
+    Err(KittError::TopicOperation(format!(
+        "Topic '{topic}' not found in delete response (received {response_count} topics in response)"
+    )))
+}
+
+/// Validates the error code from a delete topic response
+fn validate_delete_error_code(topic: &str, error_code: i16) -> Result<()> {
+    if error_code == 0 {
+        info!("Successfully deleted topic '{}'", topic);
+        return Ok(());
+    }
+
+    let error_msg = match error_code {
+        3 => "Unknown topic or partition".to_string(),
+        5 => "Leader not available".to_string(),
+        29 => "Topic authorization failed".to_string(),
+        31 => "Invalid topic exception".to_string(),
+        36 => "Not controller".to_string(),
+        60 => "Topic deletion disabled".to_string(),
+        65 => "Unknown server error".to_string(),
+        _ => format!("Unknown Kafka error code: {}", error_code),
+    };
+    Err(KittError::TopicOperation(format!(
+        "Failed to delete topic '{topic}': {error_msg}"
+    )))
 }
 
 #[cfg(test)]

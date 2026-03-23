@@ -70,17 +70,6 @@ pub struct Producer {
 
 impl Producer {
     /// Creates a new Producer instance
-    ///
-    /// # Arguments
-    /// * `client` - Shared Kafka client for network communication
-    /// * `topic` - Target topic name for message production
-    /// * `producer_partitions_per_thread` - Number of partitions to send to per batch
-    /// * `total_partitions` - Total number of partitions available for random selection
-    /// * `message_size` - Size configuration for generated messages
-    /// * `thread_id` - Unique identifier for this producer thread
-    /// * `use_sticky_partitions` - Whether to use sticky partition assignment
-    /// * `key_strategy` - Strategy for generating message keys
-    /// * `messages_per_batch` - Number of messages to include in each record batch
     #[expect(clippy::too_many_arguments, reason = "Producer configuration requires multiple parameters")]
     pub fn new(
         client: Arc<KafkaClient>,
@@ -107,18 +96,6 @@ impl Producer {
     }
 
     /// Produces messages continuously for the specified duration
-    ///
-    /// This method implements the core message production loop with:
-    /// - Partition selection (either sticky assignment or random based on configuration)
-    /// - Backpressure control to prevent memory exhaustion
-    /// - High-throughput batch processing
-    ///
-    /// # Arguments
-    /// * `config` - Configuration for message production including duration, counters, and options
-    ///
-    /// # Returns
-    /// * `Ok(())` - When production completes successfully
-    /// * `Err(anyhow::Error)` - If Kafka communication or encoding fails
     pub async fn produce_messages(&self, config: ProduceConfig) -> Result<()> {
         let ProduceConfig {
             duration,
@@ -131,29 +108,24 @@ impl Producer {
         } = config;
         let end_time = Instant::now() + duration;
 
-        // Determine partition selection strategy based on configuration
         let partition_count = self.producer_partitions_per_thread as usize;
         let start_partition = if self.use_sticky_partitions {
             self.thread_id * self.producer_partitions_per_thread as usize
         } else {
-            0 // Not used in random mode
+            0
         };
 
         let mut pending_futures = Vec::new();
-
-        // Retry logic: give up after MAX_CONSECUTIVE_ERRORS with exponential backoff
         let mut consecutive_errors: u32 = 0;
 
-        // When bytes_target is specified, ignore time limit and run until target is reached
         while bytes_target.is_some() || Instant::now() < end_time {
-            // Check if we've reached the bytes target (if specified)
             if let Some(target) = bytes_target {
                 if bytes_sent.load(Ordering::Relaxed) >= target {
                     break;
                 }
             }
 
-            // Implement backpressure control to prevent memory exhaustion
+            // Implement backpressure control
             let sent = messages_sent.load(Ordering::Relaxed);
             let received = messages_received.load(Ordering::Relaxed);
             let backlog = sent.saturating_sub(received);
@@ -163,221 +135,30 @@ impl Producer {
                 continue;
             }
 
-            // Create produce request with 1 message per partition
-            let mut request = ProduceRequest::default();
-            // acks=-1 (all): wait for all replicas. Strongest durability guarantee.
-            request.acks = -1;
-            request.timeout_ms = PRODUCE_TIMEOUT_MS;
+            // Build and send produce request
+            let (request, total_bytes_in_request) = self.build_produce_request(
+                partition_count,
+                start_partition,
+            )?;
 
-            let mut topic_data = TopicProduceData::default();
-            topic_data.name = TopicName(StrBytes::from_string(self.topic.clone()));
-
-            // Configure encoding options for the record batch
-            let options = RecordEncodeOptions {
-                version: 2,
-                compression: Compression::None,
-            };
-
-            // Track total bytes for this request
-            let mut total_bytes_in_request: u64 = 0;
-
-            // Create one message for each partition based on assignment strategy
-            for i in 0..partition_count {
-                let partition_id = if self.use_sticky_partitions {
-                    // Sticky mode: each thread has fixed partitions
-                    (start_partition + i) as i32
-                } else {
-                    // Random mode: select random partition for each message
-                    if self.total_partitions > 0 {
-                        (rand::random::<u32>() % self.total_partitions as u32) as i32
-                    } else {
-                        error!(
-                            "Producer thread {} has invalid total_partitions: {}",
-                            self.thread_id, self.total_partitions
-                        );
-                        continue;
-                    }
-                };
-
-                // Validate partition ID is within valid range (defensive programming)
-                if partition_id < 0 || partition_id >= self.total_partitions {
-                    error!(
-                        "Producer thread {} generated invalid partition ID {} (valid range: 0-{})",
-                        self.thread_id,
-                        partition_id,
-                        self.total_partitions - 1
-                    );
-                    continue; // Skip this partition and try next iteration
-                }
-
-                debug!(
-                    "Producer thread {} {} partition {} (total partitions: {})",
-                    self.thread_id,
-                    if self.use_sticky_partitions {
-                        "assigned"
-                    } else {
-                        "selecting"
-                    },
-                    partition_id,
-                    self.total_partitions
-                );
-
-                // Create multiple records for this partition's batch
-                let mut records = Vec::with_capacity(self.messages_per_batch);
-                for _ in 0..self.messages_per_batch {
-                    // Generate message with configured size
-                    let size = self.message_size.generate_size();
-                    total_bytes_in_request += size as u64;
-                    let payload = vec![b'x'; size];
-                    let timestamp =
-                        SystemTime::now().duration_since(UNIX_EPOCH)
-                            .map_err(|e| KittError::Protocol(format!("System time error: {e}")))?
-                            .as_millis() as i64;
-
-                    // Generate message key based on configured strategy (different key for each message)
-                    let key = self.key_strategy.generate_key();
-
-                    // Idempotence is disabled (producer_id=-1) because multiple threads would need
-                    // coordinated sequence numbers, which adds complexity without benefit for throughput testing.
-                    records.push(Record {
-                        transactional: false,
-                        control: false,
-                        partition_leader_epoch: 0,
-                        producer_id: -1,  // -1 disables idempotence
-                        producer_epoch: -1,
-                        timestamp_type: TimestampType::Creation,
-                        offset: 0,    // Broker assigns actual offset; 0 is placeholder
-                        sequence: -1, // Required when idempotence disabled
-                        timestamp,
-                        key,
-                        value: Some(Bytes::from(payload)),
-                        headers: indexmap::IndexMap::new(),
-                    });
-                }
-
-                // Encode all records into a single batch
-                let mut batch_buf = bytes::BytesMut::new();
-                RecordBatchEncoder::encode(
-                    &mut batch_buf,
-                    records.iter().collect::<Vec<_>>(),
-                    &options,
-                ).map_err(|e| KittError::ProduceError(format!("Failed to encode record batch: {e}")))?;
-                let batch = batch_buf.freeze();
-
-                // Create partition data
-                let mut partition_data = PartitionProduceData::default();
-                partition_data.index = partition_id;
-                partition_data.records = Some(batch);
-                topic_data.partition_data.push(partition_data);
-            }
-
-            request.topic_data.push(topic_data);
-
-            // Send the batched request asynchronously.
-            // Messages are counted AFTER the server acknowledges, not before,
-            // to prevent inflated backlog from eagerly-counted but not-yet-sent messages.
-            let version = self.client.get_supported_version(ApiKey::Produce, 3);
-            let client = self.client.clone();
-            let thread_id = self.thread_id;
-            let msg_count = partition_count as u64 * self.messages_per_batch as u64;
-            let byte_count = total_bytes_in_request;
-            let msgs_sent = messages_sent.clone();
-            let bts_sent = bytes_sent.clone();
-            let future = tokio::spawn(async move {
-                debug!(
-                    "Producer thread {} sending batch with {} partitions, producer_id=-1 (idempotence disabled)",
-                    thread_id,
-                    partition_count
-                );
-                match client.send_request(ApiKey::Produce, &request, version).await {
-                    Ok(response_bytes) => {
-                        // Count messages only after server acknowledges
-                        msgs_sent.fetch_add(msg_count, Ordering::Relaxed);
-                        bts_sent.fetch_add(byte_count, Ordering::Relaxed);
-                        // Validate the produce response if enabled
-                        if message_validation {
-                            Self::validate_produce_response(
-                                &response_bytes,
-                                version,
-                                thread_id,
-                                partition_count,
-                            )
-                            .await?;
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!(
-                            "Producer thread {} PRODUCE REQUEST FAILED: {}",
-                            thread_id, e
-                        );
-
-                        // Provide specific troubleshooting guidance
-                        let error_str = e.to_string().to_lowercase();
-                        if error_str.contains("connection") || error_str.contains("network") {
-                            error!("NETWORK ISSUE - Check broker connectivity and network configuration");
-                        } else if error_str.contains("timeout") {
-                            error!("TIMEOUT - Broker may be overloaded or network latency high");
-                        } else if error_str.contains("auth") || error_str.contains("permission") {
-                            error!(
-                                "AUTHENTICATION - Verify credentials and ACLs for this broker"
-                            );
-                        } else if error_str.contains("protocol") || error_str.contains("version") {
-                            error!("PROTOCOL MISMATCH - Broker may use different Kafka version/protocol");
-                        } else {
-                            error!("UNKNOWN ERROR - Check broker logs and configuration");
-                        }
-
-                        Err(e)
-                    }
-                }
-            });
+            let future = self.spawn_produce_task(
+                request,
+                partition_count,
+                total_bytes_in_request,
+                &messages_sent,
+                &bytes_sent,
+                message_validation,
+            );
             pending_futures.push(future);
 
-            // Drain completed futures; block when at capacity to bound in-flight requests.
-            if pending_futures.len() >= MAX_PENDING_REQUESTS {
-                // First pass: reap any already-completed futures
-                let mut i = 0;
-                while i < pending_futures.len() {
-                    if pending_futures[i].is_finished() {
-                        let result = pending_futures.remove(i).await;
-                        match result {
-                            Ok(Ok(_)) => {
-                                consecutive_errors = 0;
-                            }
-                            Ok(Err(e)) => {
-                                consecutive_errors += 1;
-                                debug!("Producer validation failed: {}", e);
-                            }
-                            Err(e) => {
-                                consecutive_errors += 1;
-                                debug!("Failed to send batch: {}", e);
-                            }
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                // If still at capacity, await the oldest request to prevent unbounded growth
-                if pending_futures.len() >= MAX_PENDING_REQUESTS {
-                    let result = pending_futures.remove(0).await;
-                    match result {
-                        Ok(Ok(_)) => {
-                            consecutive_errors = 0;
-                        }
-                        Ok(Err(e)) => {
-                            consecutive_errors += 1;
-                            debug!("Producer validation failed: {}", e);
-                        }
-                        Err(e) => {
-                            consecutive_errors += 1;
-                            debug!("Failed to send batch: {}", e);
-                        }
-                    }
-                }
-            }
+            // Drain completed futures
+            drain_pending_futures(
+                &mut pending_futures,
+                &mut consecutive_errors,
+            )
+            .await;
 
-            // Check consecutive errors and apply exponential backoff or give up
+            // Check consecutive errors and apply backoff
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                 error!(
                     "Producer thread {}: giving up after {} consecutive errors",
@@ -396,35 +177,174 @@ impl Producer {
         }
 
         // Clean up: wait for all remaining requests to complete
-        for future in pending_futures {
-            match future.await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    debug!("Producer validation failed: {}", e);
-                }
-                Err(e) => {
-                    debug!("Failed to complete pending batch: {}", e);
-                }
-            }
-        }
+        drain_remaining_futures(pending_futures).await;
 
         Ok(())
     }
 
+    /// Builds a produce request with batched records for all assigned partitions
+    fn build_produce_request(
+        &self,
+        partition_count: usize,
+        start_partition: usize,
+    ) -> Result<(ProduceRequest, u64)> {
+        let mut request = ProduceRequest::default();
+        request.acks = -1;
+        request.timeout_ms = PRODUCE_TIMEOUT_MS;
+
+        let mut topic_data = TopicProduceData::default();
+        topic_data.name = TopicName(StrBytes::from_string(self.topic.clone()));
+
+        let options = RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        };
+
+        let mut total_bytes_in_request: u64 = 0;
+
+        for i in 0..partition_count {
+            let partition_id = self.select_partition(i, start_partition);
+
+            // Validate partition ID
+            if partition_id < 0 || partition_id >= self.total_partitions {
+                error!(
+                    "Producer thread {} generated invalid partition ID {} (valid range: 0-{})",
+                    self.thread_id, partition_id, self.total_partitions - 1
+                );
+                continue;
+            }
+
+            debug!(
+                "Producer thread {} {} partition {} (total partitions: {})",
+                self.thread_id,
+                if self.use_sticky_partitions { "assigned" } else { "selecting" },
+                partition_id,
+                self.total_partitions
+            );
+
+            let (partition_data, bytes) = self.build_partition_batch(
+                partition_id,
+                &options,
+            )?;
+            total_bytes_in_request += bytes;
+            topic_data.partition_data.push(partition_data);
+        }
+
+        request.topic_data.push(topic_data);
+        Ok((request, total_bytes_in_request))
+    }
+
+    /// Selects a partition ID based on the configured strategy
+    fn select_partition(&self, index: usize, start_partition: usize) -> i32 {
+        if self.use_sticky_partitions {
+            (start_partition + index) as i32
+        } else if self.total_partitions > 0 {
+            (rand::random::<u32>() % self.total_partitions as u32) as i32
+        } else {
+            error!(
+                "Producer thread {} has invalid total_partitions: {}",
+                self.thread_id, self.total_partitions
+            );
+            -1 // Will be caught by validation
+        }
+    }
+
+    /// Builds a batch of records for a single partition
+    fn build_partition_batch(
+        &self,
+        partition_id: i32,
+        options: &RecordEncodeOptions,
+    ) -> Result<(PartitionProduceData, u64)> {
+        let mut records = Vec::with_capacity(self.messages_per_batch);
+        let mut total_bytes = 0u64;
+
+        for _ in 0..self.messages_per_batch {
+            let size = self.message_size.generate_size();
+            total_bytes += size as u64;
+            let payload = vec![b'x'; size];
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)
+                .map_err(|e| KittError::Protocol(format!("System time error: {e}")))?
+                .as_millis() as i64;
+            let key = self.key_strategy.generate_key();
+
+            records.push(Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                timestamp_type: TimestampType::Creation,
+                offset: 0,
+                sequence: -1,
+                timestamp,
+                key,
+                value: Some(Bytes::from(payload)),
+                headers: indexmap::IndexMap::new(),
+            });
+        }
+
+        let mut batch_buf = bytes::BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut batch_buf,
+            records.iter().collect::<Vec<_>>(),
+            options,
+        ).map_err(|e| KittError::ProduceError(format!("Failed to encode record batch: {e}")))?;
+        let batch = batch_buf.freeze();
+
+        let mut partition_data = PartitionProduceData::default();
+        partition_data.index = partition_id;
+        partition_data.records = Some(batch);
+
+        Ok((partition_data, total_bytes))
+    }
+
+    /// Spawns a tokio task to send a produce request
+    fn spawn_produce_task(
+        &self,
+        request: ProduceRequest,
+        partition_count: usize,
+        total_bytes_in_request: u64,
+        messages_sent: &Arc<AtomicU64>,
+        bytes_sent: &Arc<AtomicU64>,
+        message_validation: bool,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let version = self.client.get_supported_version(ApiKey::Produce, 3);
+        let client = self.client.clone();
+        let thread_id = self.thread_id;
+        let msg_count = partition_count as u64 * self.messages_per_batch as u64;
+        let byte_count = total_bytes_in_request;
+        let msgs_sent = messages_sent.clone();
+        let bts_sent = bytes_sent.clone();
+
+        tokio::spawn(async move {
+            debug!(
+                "Producer thread {} sending batch with {} partitions, producer_id=-1 (idempotence disabled)",
+                thread_id, partition_count
+            );
+            match client.send_request(ApiKey::Produce, &request, version).await {
+                Ok(response_bytes) => {
+                    msgs_sent.fetch_add(msg_count, Ordering::Relaxed);
+                    bts_sent.fetch_add(byte_count, Ordering::Relaxed);
+                    if message_validation {
+                        Self::validate_produce_response(
+                            &response_bytes,
+                            version,
+                            thread_id,
+                            partition_count,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    log_produce_request_error(thread_id, &e);
+                    Err(e)
+                }
+            }
+        })
+    }
+
     /// Validates and diagnoses PRODUCE response for troubleshooting
-    ///
-    /// This method performs comprehensive analysis of Kafka PRODUCE responses to identify
-    /// common issues that prevent message production, especially when connecting to
-    /// different brokers.
-    ///
-    /// # Arguments
-    /// * `response_bytes` - Raw response bytes from broker
-    /// * `version` - Protocol version used for the request
-    /// * `thread_id` - Producer thread ID for logging context
-    /// * `partition_count` - Number of partitions in the request
-    ///
-    /// # Returns
-    /// * `Result<()>` - OK if response is valid, Error with diagnostic info if not
     pub async fn validate_produce_response(
         response_bytes: &bytes::Bytes,
         version: i16,
@@ -435,259 +355,22 @@ impl Producer {
 
         let mut cursor = Cursor::new(response_bytes.as_ref());
 
-        // Decode response header first
         let header_version = ApiKey::Produce.response_header_version(version);
-        let _response_header = match ResponseHeader::decode(&mut cursor, header_version) {
-            Ok(header) => header,
-            Err(e) => {
-                debug!("PRODUCE RESPONSE HEADER DECODE ERROR: {}", e);
-                debug!("HEADER DECODE TROUBLESHOOT:");
-                debug!("   - Broker protocol version mismatch");
-                debug!("   - Connection may be to wrong service/port");
-                debug!("   - Broker may have sent malformed response");
-                debug!(
-                    "Expected header version: {}, response size: {} bytes",
-                    header_version,
-                    response_bytes.len()
-                );
-                return Err(KittError::Protocol(format!("Failed to decode produce response header: {e}")));
-            }
-        };
+        let _response_header = decode_produce_header(&mut cursor, header_version, response_bytes.len())?;
 
-        // Decode the produce response payload
-        let response = match ProduceResponse::decode(&mut cursor, version) {
-            Ok(response) => response,
-            Err(e) => {
-                debug!("PRODUCE RESPONSE DECODE ERROR: {}", e);
-                debug!("DECODE TROUBLESHOOT:");
-                debug!("   - Broker may use incompatible Kafka protocol version");
-                debug!("   - Response may be corrupted due to network issues");
-                debug!("   - Different broker software/version than expected");
-                debug!(
-                    "Raw response size: {} bytes, using produce version: {}",
-                    response_bytes.len(),
-                    version
-                );
-                return Err(KittError::Protocol(format!("Failed to decode produce response: {e}")));
-            }
-        };
+        let response = decode_produce_body(&mut cursor, version, response_bytes.len())?;
 
         debug!(
             "Producer thread {} received response with {} topic(s)",
-            thread_id,
-            response.responses.len()
+            thread_id, response.responses.len()
         );
 
-        let mut all_partitions_ok = true;
-        let mut diagnostics = Vec::new();
+        let (all_ok, diagnostics) = check_partition_results(&response);
 
-        // Analyze each topic response
-        for topic_response in &response.responses {
-            debug!(
-                "Topic has {} partition responses",
-                topic_response.partition_responses.len()
-            );
-
-            // Check each partition response
-            for partition_response in &topic_response.partition_responses {
-                let partition_id = partition_response.index;
-
-                // Comprehensive error code analysis
-                match partition_response.error_code {
-                    0 => {
-                        diagnostics.push(format!(
-                            "P{}: SUCCESS (broker assigned offset={})",
-                            partition_id, partition_response.base_offset
-                        ));
-                        debug!(
-                            "Partition {}: BROKER_ASSIGNED_OFFSET={}, log_append_time={}, log_start_offset={} (producer_id=-1, idempotence disabled, producer sent offset=0, broker assigned actual offset)",
-                            partition_id,
-                            partition_response.base_offset,
-                            partition_response.log_append_time_ms,
-                            partition_response.log_start_offset
-                        );
-                    }
-                    1 => {
-                        diagnostics.push(format!(
-                            "P{}: OFFSET_OUT_OF_RANGE - invalid offset specified",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    2 => {
-                        diagnostics.push(format!(
-                            "P{}: CORRUPT_MESSAGE - message failed checksum",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    3 => {
-                        diagnostics.push(format!(
-                            "P{}: UNKNOWN_TOPIC_OR_PARTITION - topic/partition doesn't exist",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    5 => {
-                        diagnostics.push(format!(
-                            "P{}: LEADER_NOT_AVAILABLE - partition leader unavailable",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    6 => {
-                        diagnostics.push(format!(
-                            "P{}: NOT_LEADER_FOR_PARTITION - broker is not the leader",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    10 => {
-                        diagnostics.push(format!(
-                            "P{}: MESSAGE_TOO_LARGE - message exceeds broker limits",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    14 => {
-                        diagnostics.push(format!(
-                            "P{}: INVALID_TOPIC_EXCEPTION - topic name is invalid",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    16 => {
-                        diagnostics.push(format!(
-                            "P{}: NETWORK_EXCEPTION - network communication failed",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    17 => {
-                        diagnostics.push(format!(
-                            "P{}: CORRUPT_MESSAGE - message is corrupted",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    25 => {
-                        diagnostics.push(format!(
-                            "P{}: INVALID_TOPIC_EXCEPTION - topic name is invalid",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    29 => {
-                        diagnostics.push(format!(
-                            "P{}: TOPIC_AUTHORIZATION_FAILED - insufficient permissions",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    34 => {
-                        diagnostics.push(format!(
-                            "P{}: UNSUPPORTED_VERSION_FOR_FEATURE - version not supported",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    43 => {
-                        diagnostics.push(format!(
-                            "P{}: INVALID_RECORD - record format invalid",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    45 => {
-                        diagnostics.push(format!(
-                            "P{}: DUPLICATE_SEQUENCE_NUMBER - sequence number already used (idempotence should be disabled)",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    48 => {
-                        diagnostics.push(format!(
-                            "P{}: INVALID_PRODUCER_EPOCH - producer epoch invalid",
-                            partition_id
-                        ));
-                        all_partitions_ok = false;
-                    }
-                    code => {
-                        diagnostics.push(format!(
-                            "P{}: Unknown error code {} - check Kafka documentation",
-                            partition_id, code
-                        ));
-                        all_partitions_ok = false;
-                    }
-                }
-
-                // Check for valid offsets on success
-                if partition_response.error_code == 0 && partition_response.base_offset < 0 {
-                    diagnostics.push(format!(
-                        "P{}: Invalid base_offset={}",
-                        partition_id, partition_response.base_offset
-                    ));
-                }
-            }
-        }
-
-        // Log comprehensive diagnostics
-        if all_partitions_ok {
-            debug!(
-                "Producer thread {} SUCCESS: All {} partitions accepted messages | {}",
-                thread_id,
-                partition_count,
-                diagnostics.join(" | ")
-            );
-
-            // Also log offset assignment summary
-            let mut offset_summary = Vec::new();
-            for topic_response in &response.responses {
-                for partition_response in &topic_response.partition_responses {
-                    if partition_response.error_code == 0 {
-                        offset_summary.push(format!(
-                            "P{}->{}",
-                            partition_response.index, partition_response.base_offset
-                        ));
-                    }
-                }
-            }
-            if !offset_summary.is_empty() {
-                debug!(
-                    "Producer thread {} OFFSET_ASSIGNMENTS: {}",
-                    thread_id,
-                    offset_summary.join(", ")
-                );
-            }
+        if all_ok {
+            log_successful_produce(thread_id, partition_count, &diagnostics, &response);
         } else {
-            debug!("Producer thread {} PRODUCE ERRORS DETECTED:", thread_id);
-            debug!("Partition Results: {}", diagnostics.join(" | "));
-
-            // Provide troubleshooting guidance based on error patterns
-            let error_summary = diagnostics.join(" ");
-            if error_summary.contains("UNKNOWN_TOPIC_OR_PARTITION") {
-                debug!("TOPIC ISSUE - Verify topic exists on this broker and partition count matches");
-            }
-            if error_summary.contains("TOPIC_AUTHORIZATION_FAILED") {
-                debug!("PERMISSION ISSUE - Check ACLs and authentication credentials for this broker");
-            }
-            if error_summary.contains("NOT_LEADER_FOR_PARTITION") {
-                debug!("LEADERSHIP ISSUE - Broker may not be partition leader, check cluster metadata");
-            }
-            if error_summary.contains("MESSAGE_TOO_LARGE") {
-                debug!("SIZE ISSUE - Message exceeds broker's max.message.bytes setting");
-            }
-            if error_summary.contains("NETWORK_EXCEPTION") {
-                debug!("NETWORK ISSUE - Check network connectivity and broker stability");
-            }
-            if error_summary.contains("DUPLICATE_SEQUENCE_NUMBER") {
-                debug!("SEQUENCE ISSUE - Idempotent producer causing sequence conflicts");
-                debug!("   - Producer is configured with idempotence disabled (producer_id=-1)");
-                debug!("   - This error should not occur with current configuration");
-                debug!("   - Check if broker requires idempotent producers");
-                debug!("   - Verify broker version compatibility");
-            }
-
+            log_failed_produce(thread_id, &diagnostics);
             return Err(KittError::ProduceError(format!(
                 "Produce request failed for {} partitions",
                 diagnostics.iter().filter(|d| d.contains("P") && !d.contains("SUCCESS")).count()
@@ -695,6 +378,266 @@ impl Producer {
         }
 
         Ok(())
+    }
+}
+
+/// Decodes the produce response header
+fn decode_produce_header(
+    cursor: &mut std::io::Cursor<&[u8]>,
+    header_version: i16,
+    response_len: usize,
+) -> Result<ResponseHeader> {
+    ResponseHeader::decode(cursor, header_version).map_err(|e| {
+        debug!("PRODUCE RESPONSE HEADER DECODE ERROR: {}", e);
+        debug!("HEADER DECODE TROUBLESHOOT:");
+        debug!("   - Broker protocol version mismatch");
+        debug!("   - Connection may be to wrong service/port");
+        debug!("   - Broker may have sent malformed response");
+        debug!(
+            "Expected header version: {}, response size: {} bytes",
+            header_version, response_len
+        );
+        KittError::Protocol(format!("Failed to decode produce response header: {e}"))
+    })
+}
+
+/// Decodes the produce response body
+fn decode_produce_body(
+    cursor: &mut std::io::Cursor<&[u8]>,
+    version: i16,
+    response_len: usize,
+) -> Result<ProduceResponse> {
+    ProduceResponse::decode(cursor, version).map_err(|e| {
+        debug!("PRODUCE RESPONSE DECODE ERROR: {}", e);
+        debug!("DECODE TROUBLESHOOT:");
+        debug!("   - Broker may use incompatible Kafka protocol version");
+        debug!("   - Response may be corrupted due to network issues");
+        debug!("   - Different broker software/version than expected");
+        debug!(
+            "Raw response size: {} bytes, using produce version: {}",
+            response_len, version
+        );
+        KittError::Protocol(format!("Failed to decode produce response: {e}"))
+    })
+}
+
+/// Checks all partition results in a produce response
+fn check_partition_results(response: &ProduceResponse) -> (bool, Vec<String>) {
+    let mut all_partitions_ok = true;
+    let mut diagnostics = Vec::new();
+
+    for topic_response in &response.responses {
+        debug!(
+            "Topic has {} partition responses",
+            topic_response.partition_responses.len()
+        );
+
+        for partition_response in &topic_response.partition_responses {
+            let partition_id = partition_response.index;
+
+            let (ok, diagnostic) = diagnose_partition_error(
+                partition_id,
+                partition_response.error_code,
+                partition_response.base_offset,
+                partition_response.log_append_time_ms,
+                partition_response.log_start_offset,
+            );
+
+            if !ok {
+                all_partitions_ok = false;
+            }
+            diagnostics.push(diagnostic);
+
+            // Check for valid offsets on success
+            if partition_response.error_code == 0 && partition_response.base_offset < 0 {
+                diagnostics.push(format!(
+                    "P{}: Invalid base_offset={}",
+                    partition_id, partition_response.base_offset
+                ));
+            }
+        }
+    }
+
+    (all_partitions_ok, diagnostics)
+}
+
+/// Diagnoses a single partition's error code
+fn diagnose_partition_error(
+    partition_id: i32,
+    error_code: i16,
+    base_offset: i64,
+    log_append_time_ms: i64,
+    log_start_offset: i64,
+) -> (bool, String) {
+    match error_code {
+        0 => {
+            debug!(
+                "Partition {}: BROKER_ASSIGNED_OFFSET={}, log_append_time={}, log_start_offset={} (producer_id=-1, idempotence disabled, producer sent offset=0, broker assigned actual offset)",
+                partition_id, base_offset, log_append_time_ms, log_start_offset
+            );
+            (true, format!("P{}: SUCCESS (broker assigned offset={})", partition_id, base_offset))
+        }
+        1 => (false, format!("P{}: OFFSET_OUT_OF_RANGE - invalid offset specified", partition_id)),
+        2 => (false, format!("P{}: CORRUPT_MESSAGE - message failed checksum", partition_id)),
+        3 => (false, format!("P{}: UNKNOWN_TOPIC_OR_PARTITION - topic/partition doesn't exist", partition_id)),
+        5 => (false, format!("P{}: LEADER_NOT_AVAILABLE - partition leader unavailable", partition_id)),
+        6 => (false, format!("P{}: NOT_LEADER_FOR_PARTITION - broker is not the leader", partition_id)),
+        10 => (false, format!("P{}: MESSAGE_TOO_LARGE - message exceeds broker limits", partition_id)),
+        14 => (false, format!("P{}: INVALID_TOPIC_EXCEPTION - topic name is invalid", partition_id)),
+        16 => (false, format!("P{}: NETWORK_EXCEPTION - network communication failed", partition_id)),
+        17 => (false, format!("P{}: CORRUPT_MESSAGE - message is corrupted", partition_id)),
+        25 => (false, format!("P{}: INVALID_TOPIC_EXCEPTION - topic name is invalid", partition_id)),
+        29 => (false, format!("P{}: TOPIC_AUTHORIZATION_FAILED - insufficient permissions", partition_id)),
+        34 => (false, format!("P{}: UNSUPPORTED_VERSION_FOR_FEATURE - version not supported", partition_id)),
+        43 => (false, format!("P{}: INVALID_RECORD - record format invalid", partition_id)),
+        45 => (false, format!("P{}: DUPLICATE_SEQUENCE_NUMBER - sequence number already used (idempotence should be disabled)", partition_id)),
+        48 => (false, format!("P{}: INVALID_PRODUCER_EPOCH - producer epoch invalid", partition_id)),
+        code => (false, format!("P{}: Unknown error code {} - check Kafka documentation", partition_id, code)),
+    }
+}
+
+/// Logs a successful produce response
+fn log_successful_produce(
+    thread_id: usize,
+    partition_count: usize,
+    diagnostics: &[String],
+    response: &ProduceResponse,
+) {
+    debug!(
+        "Producer thread {} SUCCESS: All {} partitions accepted messages | {}",
+        thread_id, partition_count, diagnostics.join(" | ")
+    );
+
+    let mut offset_summary = Vec::new();
+    for topic_response in &response.responses {
+        for partition_response in &topic_response.partition_responses {
+            if partition_response.error_code == 0 {
+                offset_summary.push(format!(
+                    "P{}->{}",
+                    partition_response.index, partition_response.base_offset
+                ));
+            }
+        }
+    }
+    if !offset_summary.is_empty() {
+        debug!(
+            "Producer thread {} OFFSET_ASSIGNMENTS: {}",
+            thread_id,
+            offset_summary.join(", ")
+        );
+    }
+}
+
+/// Logs a failed produce response with troubleshooting guidance
+fn log_failed_produce(thread_id: usize, diagnostics: &[String]) {
+    debug!("Producer thread {} PRODUCE ERRORS DETECTED:", thread_id);
+    debug!("Partition Results: {}", diagnostics.join(" | "));
+
+    let error_summary = diagnostics.join(" ");
+    if error_summary.contains("UNKNOWN_TOPIC_OR_PARTITION") {
+        debug!("TOPIC ISSUE - Verify topic exists on this broker and partition count matches");
+    }
+    if error_summary.contains("TOPIC_AUTHORIZATION_FAILED") {
+        debug!("PERMISSION ISSUE - Check ACLs and authentication credentials for this broker");
+    }
+    if error_summary.contains("NOT_LEADER_FOR_PARTITION") {
+        debug!("LEADERSHIP ISSUE - Broker may not be partition leader, check cluster metadata");
+    }
+    if error_summary.contains("MESSAGE_TOO_LARGE") {
+        debug!("SIZE ISSUE - Message exceeds broker's max.message.bytes setting");
+    }
+    if error_summary.contains("NETWORK_EXCEPTION") {
+        debug!("NETWORK ISSUE - Check network connectivity and broker stability");
+    }
+    if error_summary.contains("DUPLICATE_SEQUENCE_NUMBER") {
+        debug!("SEQUENCE ISSUE - Idempotent producer causing sequence conflicts");
+        debug!("   - Producer is configured with idempotence disabled (producer_id=-1)");
+        debug!("   - This error should not occur with current configuration");
+        debug!("   - Check if broker requires idempotent producers");
+        debug!("   - Verify broker version compatibility");
+    }
+}
+
+/// Logs a produce request error with troubleshooting guidance
+fn log_produce_request_error(thread_id: usize, err: &KittError) {
+    error!(
+        "Producer thread {} PRODUCE REQUEST FAILED: {}",
+        thread_id, err
+    );
+
+    let error_str = err.to_string().to_lowercase();
+    if error_str.contains("connection") || error_str.contains("network") {
+        error!("NETWORK ISSUE - Check broker connectivity and network configuration");
+    } else if error_str.contains("timeout") {
+        error!("TIMEOUT - Broker may be overloaded or network latency high");
+    } else if error_str.contains("auth") || error_str.contains("permission") {
+        error!("AUTHENTICATION - Verify credentials and ACLs for this broker");
+    } else if error_str.contains("protocol") || error_str.contains("version") {
+        error!("PROTOCOL MISMATCH - Broker may use different Kafka version/protocol");
+    } else {
+        error!("UNKNOWN ERROR - Check broker logs and configuration");
+    }
+}
+
+/// Drains completed futures from the pending list, blocking if at capacity
+async fn drain_pending_futures(
+    pending_futures: &mut Vec<tokio::task::JoinHandle<Result<()>>>,
+    consecutive_errors: &mut u32,
+) {
+    if pending_futures.len() < MAX_PENDING_REQUESTS {
+        return;
+    }
+
+    // First pass: reap any already-completed futures
+    let mut i = 0;
+    while i < pending_futures.len() {
+        if pending_futures[i].is_finished() {
+            let result = pending_futures.remove(i).await;
+            handle_future_result(result, consecutive_errors);
+        } else {
+            i += 1;
+        }
+    }
+
+    // If still at capacity, await the oldest request
+    if pending_futures.len() >= MAX_PENDING_REQUESTS {
+        let result = pending_futures.remove(0).await;
+        handle_future_result(result, consecutive_errors);
+    }
+}
+
+/// Handles the result of a completed produce future
+fn handle_future_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    consecutive_errors: &mut u32,
+) {
+    match result {
+        Ok(Ok(_)) => {
+            *consecutive_errors = 0;
+        }
+        Ok(Err(e)) => {
+            *consecutive_errors += 1;
+            debug!("Producer validation failed: {}", e);
+        }
+        Err(e) => {
+            *consecutive_errors += 1;
+            debug!("Failed to send batch: {}", e);
+        }
+    }
+}
+
+/// Waits for all remaining pending futures to complete
+async fn drain_remaining_futures(pending_futures: Vec<tokio::task::JoinHandle<Result<()>>>) {
+    for future in pending_futures {
+        match future.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                debug!("Producer validation failed: {}", e);
+            }
+            Err(e) => {
+                debug!("Failed to complete pending batch: {}", e);
+            }
+        }
     }
 }
 
@@ -724,7 +667,6 @@ pub fn test_produce_response_validation() {
     let mut success_response = ProduceResponse::default();
     success_response.responses.push(success_topic);
 
-    // Skip encoding test for now due to complexity - just show the concept
     println!("Success case: P0 SUCCESS (broker assigned offset=100)");
 
     // Test 2: Authorization failed

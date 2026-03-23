@@ -416,17 +416,45 @@ async fn run_measurement(
         quiet,
     } = config;
 
-    // Spawn producers and consumers as separate tokio tasks for true parallelism.
-    // Each task gets its own Kafka connection to avoid head-of-line blocking.
-    let mut producer_handles = Vec::new();
-    let mut consumer_handles = Vec::new();
+    let producer_handles = spawn_producer_tasks(
+        producers, &measurer, total_test_duration, max_backlog,
+        message_validation, produce_only_target,
+    );
 
+    let consumer_handles = spawn_consumer_tasks(
+        consumers, produce_only, &measurer, total_test_duration, message_validation,
+    );
+
+    let measurement_handle = spawn_measurement_task(
+        measurer, quiet, produce_only, measurement_duration,
+        max_backlog, fetch_delay, produce_only_target,
+    );
+
+    // Wait for all tasks: producers first, then consumers, then measurement
+    for handle in producer_handles {
+        let _ = handle.await;
+    }
+    for handle in consumer_handles {
+        let _ = handle.await;
+    }
+    let _ = measurement_handle.await;
+}
+
+/// Spawns producer tasks as separate tokio tasks
+fn spawn_producer_tasks(
+    producers: Vec<Producer>,
+    measurer: &ThroughputMeasurer,
+    total_test_duration: Duration,
+    max_backlog: u64,
+    message_validation: bool,
+    produce_only_target: Option<u64>,
+) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+    let mut handles = Vec::new();
     for producer in producers {
         let messages_sent = measurer.messages_sent.clone();
         let bytes_sent = measurer.bytes_sent.clone();
         let messages_received = measurer.messages_received.clone();
-        let bytes_target = produce_only_target;
-        let producer_handle = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             producer
                 .produce_messages(ProduceConfig {
                     duration: total_test_duration,
@@ -435,115 +463,156 @@ async fn run_measurement(
                     messages_received,
                     max_backlog,
                     message_validation,
-                    bytes_target,
+                    bytes_target: produce_only_target,
                 })
                 .await
         });
-        producer_handles.push(producer_handle);
+        handles.push(handle);
     }
+    handles
+}
 
+/// Spawns consumer tasks as separate tokio tasks
+fn spawn_consumer_tasks(
+    consumers: Vec<Consumer>,
+    produce_only: bool,
+    measurer: &ThroughputMeasurer,
+    total_test_duration: Duration,
+    message_validation: bool,
+) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+    let mut handles = Vec::new();
     if !produce_only {
         for consumer in consumers {
             let messages_received = measurer.messages_received.clone();
-            let consumer_handle = tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 consumer
                     .consume_messages(total_test_duration, messages_received, message_validation)
                     .await
             });
-            consumer_handles.push(consumer_handle);
+            handles.push(handle);
         }
     }
+    handles
+}
 
-    let measurement_handle = tokio::spawn({
-        let measurer = measurer.clone();
-        async move {
-            let (min_rate, max_rate, elapsed) = if quiet {
-                measurer
-                    .measure_quiet(
-                        measurement_duration,
-                        max_backlog,
-                        fetch_delay,
-                        produce_only,
-                        produce_only_target,
-                    )
-                    .await
-            } else {
-                measurer
-                    .measure(
-                        measurement_duration,
-                        "MEASUREMENT",
-                        max_backlog,
-                        fetch_delay,
-                        produce_only,
-                        produce_only_target,
-                    )
-                    .await
-            };
+/// Spawns the measurement and reporting task
+fn spawn_measurement_task(
+    measurer: ThroughputMeasurer,
+    quiet: bool,
+    produce_only: bool,
+    measurement_duration: Duration,
+    max_backlog: u64,
+    fetch_delay: u64,
+    produce_only_target: Option<u64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (min_rate, max_rate, elapsed) = if quiet {
+            measurer
+                .measure_quiet(measurement_duration, max_backlog, fetch_delay, produce_only, produce_only_target)
+                .await
+        } else {
+            measurer
+                .measure(measurement_duration, "MEASUREMENT", max_backlog, fetch_delay, produce_only, produce_only_target)
+                .await
+        };
 
-            let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
-            let final_received = measurer.messages_received.load(Ordering::Relaxed);
-            let total_data_sent = measurer.bytes_sent.load(Ordering::Relaxed);
+        print_results(&measurer, quiet, produce_only, min_rate, max_rate, elapsed);
+    })
+}
 
-            if quiet {
-                // Machine-readable output: space-separated key=value pairs
-                let throughput = if produce_only {
-                    final_sent as f64 / elapsed.as_secs_f64()
-                } else {
-                    final_received as f64 / elapsed.as_secs_f64()
-                };
+/// Prints final results (quiet mode or verbose mode)
+fn print_results(
+    measurer: &ThroughputMeasurer,
+    quiet: bool,
+    produce_only: bool,
+    min_rate: f64,
+    max_rate: f64,
+    elapsed: Duration,
+) {
+    let final_sent = measurer.messages_sent.load(Ordering::Relaxed);
+    let final_received = measurer.messages_received.load(Ordering::Relaxed);
+    let total_data_sent = measurer.bytes_sent.load(Ordering::Relaxed);
 
-                if produce_only {
-                    println!(
-                        "messages_sent={} bytes_sent={} throughput_msg_per_sec={:.1} min_rate={:.1} max_rate={:.1}",
-                        final_sent, total_data_sent, throughput, min_rate, max_rate
-                    );
-                } else {
-                    let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
-                    let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
-                    let avg_backlog = if backlog_count > 0 {
-                        backlog_sum / backlog_count
-                    } else {
-                        0
-                    };
-                    println!(
-                        "messages_sent={} bytes_sent={} messages_received={} throughput_msg_per_sec={:.1} min_rate={:.1} max_rate={:.1} avg_backlog_pct={}",
-                        final_sent, total_data_sent, final_received, throughput, min_rate, max_rate, avg_backlog
-                    );
-                }
-            } else {
-                info!("=== FINAL RESULTS ===");
-                if produce_only {
-                    let throughput = final_sent as f64 / elapsed.as_secs_f64();
-                    info!(
-                        "Messages sent: {}, Data sent: {}, Producer throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s)",
-                        final_sent, format_bytes(total_data_sent), throughput, min_rate, max_rate
-                    );
-                } else {
-                    let throughput = final_received as f64 / elapsed.as_secs_f64();
-                    let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
-                    let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
-                    let avg_backlog = if backlog_count > 0 {
-                        backlog_sum / backlog_count
-                    } else {
-                        0
-                    };
-                    info!("Messages sent: {}, Data sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, avg backlog: {}%)",
-                        final_sent, format_bytes(total_data_sent), final_received, throughput, min_rate, max_rate, avg_backlog
-                    );
-                }
-            }
-        }
-    });
-
-    // Wait for all tasks to complete. Order matters: producers first (they drive the test),
-    // then consumers, then measurement (which needs final counts).
-    for handle in producer_handles {
-        let _ = handle.await;
+    if quiet {
+        print_quiet_results(
+            produce_only, final_sent, final_received, total_data_sent,
+            min_rate, max_rate, elapsed, measurer,
+        );
+    } else {
+        print_verbose_results(
+            produce_only, final_sent, final_received, total_data_sent,
+            min_rate, max_rate, elapsed, measurer,
+        );
     }
-    for handle in consumer_handles {
-        let _ = handle.await;
+}
+
+/// Prints machine-readable results
+fn print_quiet_results(
+    produce_only: bool,
+    final_sent: u64,
+    final_received: u64,
+    total_data_sent: u64,
+    min_rate: f64,
+    max_rate: f64,
+    elapsed: Duration,
+    measurer: &ThroughputMeasurer,
+) {
+    let throughput = if produce_only {
+        final_sent as f64 / elapsed.as_secs_f64()
+    } else {
+        final_received as f64 / elapsed.as_secs_f64()
+    };
+
+    if produce_only {
+        println!(
+            "messages_sent={} bytes_sent={} throughput_msg_per_sec={:.1} min_rate={:.1} max_rate={:.1}",
+            final_sent, total_data_sent, throughput, min_rate, max_rate
+        );
+    } else {
+        let avg_backlog = calculate_avg_backlog(measurer);
+        println!(
+            "messages_sent={} bytes_sent={} messages_received={} throughput_msg_per_sec={:.1} min_rate={:.1} max_rate={:.1} avg_backlog_pct={}",
+            final_sent, total_data_sent, final_received, throughput, min_rate, max_rate, avg_backlog
+        );
     }
-    let _ = measurement_handle.await;
+}
+
+/// Prints human-readable results
+fn print_verbose_results(
+    produce_only: bool,
+    final_sent: u64,
+    final_received: u64,
+    total_data_sent: u64,
+    min_rate: f64,
+    max_rate: f64,
+    elapsed: Duration,
+    measurer: &ThroughputMeasurer,
+) {
+    info!("=== FINAL RESULTS ===");
+    if produce_only {
+        let throughput = final_sent as f64 / elapsed.as_secs_f64();
+        info!(
+            "Messages sent: {}, Data sent: {}, Producer throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s)",
+            final_sent, format_bytes(total_data_sent), throughput, min_rate, max_rate
+        );
+    } else {
+        let throughput = final_received as f64 / elapsed.as_secs_f64();
+        let avg_backlog = calculate_avg_backlog(measurer);
+        info!("Messages sent: {}, Data sent: {}, Messages received: {}, Throughput: {:.1} messages/second (min: {:.1} msg/s, max: {:.1} msg/s, avg backlog: {}%)",
+            final_sent, format_bytes(total_data_sent), final_received, throughput, min_rate, max_rate, avg_backlog
+        );
+    }
+}
+
+/// Calculates average backlog percentage from the measurer
+fn calculate_avg_backlog(measurer: &ThroughputMeasurer) -> u64 {
+    let backlog_sum = measurer.backlog_percentage_sum.load(Ordering::Relaxed);
+    let backlog_count = measurer.backlog_measurement_count.load(Ordering::Relaxed);
+    if backlog_count > 0 {
+        backlog_sum / backlog_count
+    } else {
+        0
+    }
 }
 
 /// Print troubleshooting guidance if needed
@@ -568,71 +637,11 @@ fn print_final_analysis(
     println!("================================");
 
     if final_sent == 0 {
-        println!("CRITICAL: No messages were sent by producers!");
-        println!("\nPRODUCER TROUBLESHOOTING CHECKLIST:");
-        println!("1. Broker Connectivity:");
-        println!("   - Verify broker address: {}", args.broker);
-        println!("   - Check network connectivity to broker");
-        println!("   - Ensure broker is running and accepting connections");
-
-        println!("\n2. Topic & Partition Configuration:");
-        println!(
-            "   - Topic '{}' was created with {} partitions",
-            topic_name, total_partitions
-        );
-        println!("   - Verify topic exists on the target broker");
-        println!("   - Check partition leadership assignments");
-
-        println!("\n3. Authentication & Authorization:");
-        println!("   - Verify client has WRITE permissions on topic");
-        println!("   - Check ACLs and security settings");
-        println!("   - Ensure authentication credentials are correct");
-
-        println!("\n4. Re-run with enhanced diagnostics:");
-        println!("   cargo run -- --broker {} --debug-produce", args.broker);
+        print_producer_troubleshooting(&args.broker, topic_name, total_partitions);
     } else if final_received == 0 && args.produce_only.is_none() {
-        println!("CRITICAL: No messages were received by consumers!");
-        println!("\nCONSUMER TROUBLESHOOTING CHECKLIST:");
-        println!("1. Broker Connectivity:");
-        println!("   - Verify broker address: {}", args.broker);
-        println!("   - Check network connectivity to broker");
-        println!("   - Ensure broker is running and accepting connections");
-
-        println!("\n2. Topic & Partition Configuration:");
-        println!(
-            "   - Topic '{}' was created with {} partitions",
-            topic_name, total_partitions
-        );
-        println!("   - Verify topic exists on the target broker");
-        println!("   - Check partition leadership and replica assignments");
-
-        println!("\n3. Authentication & Authorization:");
-        println!("   - Verify client has READ permissions on topic");
-        println!("   - Check ACLs and security settings");
-        println!("   - Ensure authentication credentials are correct");
-
-        println!("\n4. Protocol Compatibility:");
-        println!("   - Different brokers may use different Kafka versions");
-        println!("   - Check broker logs for protocol errors");
-        println!("   - Verify FETCH request version compatibility");
-
-        println!("\n5. Re-run with enhanced diagnostics:");
-        println!("   cargo run -- --broker {} --debug-fetch", args.broker);
-        println!("   cargo run -- --broker {} --debug-produce", args.broker);
+        print_consumer_troubleshooting(&args.broker, topic_name, total_partitions);
     } else if final_received < final_sent && args.produce_only.is_none() {
-        let loss_rate = ((final_sent - final_received) as f64 / final_sent as f64) * 100.0;
-        println!(
-            "Message loss detected: {:.1}% ({} sent, {} received)",
-            loss_rate, final_sent, final_received
-        );
-
-        if loss_rate > 5.0 {
-            println!("\nHIGH LOSS RATE TROUBLESHOOTING:");
-            println!("   - Consumer may be falling behind producer");
-            println!("   - Broker may be dropping messages under load");
-            println!("   - Network issues causing incomplete fetches");
-            println!("   - Consider increasing fetch timeout or reducing producer rate");
-        }
+        print_message_loss_analysis(final_sent, final_received);
     } else {
         println!("Consumer performance looks healthy");
         println!(
@@ -641,11 +650,84 @@ fn print_final_analysis(
         );
     }
 
+    print_consumer_config(num_consumer_threads, args.consumer_partitions_per_thread);
+}
+
+/// Prints producer troubleshooting checklist
+fn print_producer_troubleshooting(broker: &str, topic_name: &str, total_partitions: i32) {
+    println!("CRITICAL: No messages were sent by producers!");
+    println!("\nPRODUCER TROUBLESHOOTING CHECKLIST:");
+    println!("1. Broker Connectivity:");
+    println!("   - Verify broker address: {}", broker);
+    println!("   - Check network connectivity to broker");
+    println!("   - Ensure broker is running and accepting connections");
+    println!("\n2. Topic & Partition Configuration:");
+    println!(
+        "   - Topic '{}' was created with {} partitions",
+        topic_name, total_partitions
+    );
+    println!("   - Verify topic exists on the target broker");
+    println!("   - Check partition leadership assignments");
+    println!("\n3. Authentication & Authorization:");
+    println!("   - Verify client has WRITE permissions on topic");
+    println!("   - Check ACLs and security settings");
+    println!("   - Ensure authentication credentials are correct");
+    println!("\n4. Re-run with enhanced diagnostics:");
+    println!("   cargo run -- --broker {} --debug-produce", broker);
+}
+
+/// Prints consumer troubleshooting checklist
+fn print_consumer_troubleshooting(broker: &str, topic_name: &str, total_partitions: i32) {
+    println!("CRITICAL: No messages were received by consumers!");
+    println!("\nCONSUMER TROUBLESHOOTING CHECKLIST:");
+    println!("1. Broker Connectivity:");
+    println!("   - Verify broker address: {}", broker);
+    println!("   - Check network connectivity to broker");
+    println!("   - Ensure broker is running and accepting connections");
+    println!("\n2. Topic & Partition Configuration:");
+    println!(
+        "   - Topic '{}' was created with {} partitions",
+        topic_name, total_partitions
+    );
+    println!("   - Verify topic exists on the target broker");
+    println!("   - Check partition leadership and replica assignments");
+    println!("\n3. Authentication & Authorization:");
+    println!("   - Verify client has READ permissions on topic");
+    println!("   - Check ACLs and security settings");
+    println!("   - Ensure authentication credentials are correct");
+    println!("\n4. Protocol Compatibility:");
+    println!("   - Different brokers may use different Kafka versions");
+    println!("   - Check broker logs for protocol errors");
+    println!("   - Verify FETCH request version compatibility");
+    println!("\n5. Re-run with enhanced diagnostics:");
+    println!("   cargo run -- --broker {} --debug-fetch", broker);
+    println!("   cargo run -- --broker {} --debug-produce", broker);
+}
+
+/// Prints message loss analysis
+fn print_message_loss_analysis(final_sent: u64, final_received: u64) {
+    let loss_rate = ((final_sent - final_received) as f64 / final_sent as f64) * 100.0;
+    println!(
+        "Message loss detected: {:.1}% ({} sent, {} received)",
+        loss_rate, final_sent, final_received
+    );
+
+    if loss_rate > 5.0 {
+        println!("\nHIGH LOSS RATE TROUBLESHOOTING:");
+        println!("   - Consumer may be falling behind producer");
+        println!("   - Broker may be dropping messages under load");
+        println!("   - Network issues causing incomplete fetches");
+        println!("   - Consider increasing fetch timeout or reducing producer rate");
+    }
+}
+
+/// Prints consumer configuration summary
+fn print_consumer_config(num_consumer_threads: usize, consumer_partitions_per_thread: i32) {
     println!("\nConsumer Configuration Used:");
     println!("   - Consumer threads: {}", num_consumer_threads);
     println!(
         "   - Partitions per thread: {}",
-        args.consumer_partitions_per_thread
+        consumer_partitions_per_thread
     );
     println!("   - Fetch timeout: 5000ms");
     println!("   - Max fetch size: 50MB");
