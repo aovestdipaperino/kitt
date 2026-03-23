@@ -47,6 +47,7 @@ use tracing::{debug, info, warn};
 pub struct KafkaClient {
     /// Thread-safe TCP stream for broker communication
     /// Uses Arc<Mutex<>> to allow sharing across async tasks while ensuring exclusive access
+    // Lock ordering: single lock — no ordering needed. `stream` is the only shared mutable resource.
     stream: Arc<Mutex<TcpStream>>,
 
     /// Monotonically increasing correlation ID for request/response matching
@@ -86,6 +87,9 @@ impl KafkaClient {
     /// let client = KafkaClient::connect("localhost:9092").await?;
     /// ```
     pub async fn connect(broker: &str) -> Result<Self> {
+        // Precondition: broker address must be non-empty
+        assert!(!broker.is_empty(), "broker address must not be empty");
+
         info!("Connecting to Kafka broker at {}", broker);
 
         // Establish TCP connection with retry mechanism
@@ -102,6 +106,9 @@ impl KafkaClient {
 
         // Discover broker's supported API versions for compatibility
         client.discover_api_versions().await?;
+
+        // Postcondition: API versions must have been discovered
+        assert!(!client.api_versions.is_empty(), "api_versions must be populated after connect");
 
         Ok(client)
     }
@@ -123,6 +130,9 @@ impl KafkaClient {
         broker: &str,
         api_versions: HashMap<i16, (i16, i16)>,
     ) -> Result<Self> {
+        // Precondition: broker address must be non-empty
+        assert!(!broker.is_empty(), "broker address must not be empty");
+
         debug!(
             "Connecting to Kafka broker at {} (using pre-discovered API versions)",
             broker
@@ -137,11 +147,14 @@ impl KafkaClient {
             })?;
 
         debug!("Successfully connected to Kafka broker");
-        Ok(KafkaClient {
+        let client = KafkaClient {
             stream: Arc::new(Mutex::new(stream)),
             correlation_id: AtomicU64::new(1),
             api_versions, // Use provided versions instead of discovering
-        })
+        };
+        // Postcondition: stream is held inside Arc<Mutex<>> (always true if we reached here)
+        assert!(client.correlation_id.load(Ordering::SeqCst) >= 1, "correlation_id must start at 1 or higher");
+        Ok(client)
     }
 
     /// Attempts to establish TCP connection with retry mechanism
@@ -209,6 +222,9 @@ impl KafkaClient {
         request: &T,
         version: i16,
     ) -> Result<Bytes> {
+        // Precondition: protocol version must be non-negative
+        assert!(version >= 0, "protocol version must be >= 0, got {}", version);
+
         // Generate unique correlation ID for this request
         // Used to match response with request in async environments
         let correlation_id = self.correlation_id.fetch_add(1, Ordering::SeqCst) as i32;
@@ -252,7 +268,10 @@ impl KafkaClient {
         debug!("Sending message of {} bytes", message.len());
 
         // Send request over TCP connection (thread-safe access)
-        let mut stream = self.stream.lock().await;
+        let mut stream = tokio::time::timeout(
+            Duration::from_millis(TOPIC_OPERATION_TIMEOUT_MS as u64),
+            self.stream.lock(),
+        ).await.map_err(|_| KittError::Timeout(Duration::from_millis(TOPIC_OPERATION_TIMEOUT_MS as u64)))?;
         stream
             .write_all(&message)
             .await
@@ -283,7 +302,10 @@ impl KafkaClient {
             .map_err(|e| KittError::Protocol(format!("Failed to read response body: {e}")))?;
 
         debug!("Successfully received response");
-        Ok(Bytes::from(response_buf))
+        let result = Bytes::from(response_buf);
+        // Postcondition: response must not be empty (a valid Kafka response always has bytes)
+        assert!(!result.is_empty(), "response from broker must not be empty");
+        Ok(result)
     }
 
     /// Discovers and caches the broker's supported API versions
@@ -332,6 +354,8 @@ impl KafkaClient {
         }
 
         debug!("Discovered {} supported APIs", self.api_versions.len());
+        // Postcondition: must have discovered at least one API version
+        assert!(!self.api_versions.is_empty(), "discover_api_versions must populate at least one API version");
         Ok(())
     }
 
@@ -355,7 +379,10 @@ impl KafkaClient {
     /// // Returns 7 if broker supports it, otherwise broker's max supported version
     /// ```
     pub fn get_supported_version(&self, api_key: ApiKey, preferred_version: i16) -> i16 {
-        if let Some((min_version, max_version)) = self.api_versions.get(&(api_key as i16)) {
+        // Precondition: preferred version must be non-negative
+        assert!(preferred_version >= 0, "preferred_version must be >= 0, got {}", preferred_version);
+
+        let result = if let Some((min_version, max_version)) = self.api_versions.get(&(api_key as i16)) {
             // Check if preferred version falls within broker's supported range
             if preferred_version >= *min_version && preferred_version <= *max_version {
                 preferred_version // Use preferred version - it's supported
@@ -374,7 +401,10 @@ impl KafkaClient {
                 api_key, preferred_version
             );
             preferred_version
-        }
+        };
+        // Postcondition: returned version must be non-negative
+        assert!(result >= 0, "get_supported_version must return a non-negative version, got {}", result);
+        result
     }
 
     /// Creates a new Kafka topic with specified configuration
@@ -403,6 +433,10 @@ impl KafkaClient {
         partitions: i32,
         replication_factor: i16,
     ) -> Result<()> {
+        // Preconditions: topic name must not be empty and partitions must be positive
+        assert!(!topic.is_empty(), "topic name must not be empty");
+        assert!(partitions > 0, "partition count must be > 0, got {}", partitions);
+
         debug!("Creating topic '{}' with {} partitions", topic, partitions);
 
         // Build CreateTopics request with topic configuration
@@ -453,6 +487,9 @@ impl KafkaClient {
     /// # Warning
     /// This operation is irreversible and will permanently delete all data in the topic.
     pub async fn delete_topic(&self, topic: &str) -> Result<()> {
+        // Precondition: topic name must not be empty
+        assert!(!topic.is_empty(), "topic name must not be empty for delete_topic");
+
         debug!("Deleting topic '{}'", topic);
 
         let request = build_delete_topic_request(topic)?;
@@ -478,6 +515,9 @@ impl KafkaClient {
     /// * `Ok(TopicMetadata)` - Topic metadata if topic exists
     /// * `Err(anyhow::Error)` - If topic doesn't exist or query fails
     pub async fn get_topic_metadata(&self, topic: &str) -> Result<TopicMetadata> {
+        // Precondition: topic name must not be empty
+        assert!(!topic.is_empty(), "topic name must not be empty for get_topic_metadata");
+
         debug!("Getting metadata for topic '{}'", topic);
 
         let mut request = MetadataRequest::default();
@@ -517,6 +557,8 @@ impl KafkaClient {
 
                 let partition_count = topic_metadata.partitions.len() as i32;
                 debug!("Topic '{}' has {} partitions", topic, partition_count);
+                // Postcondition: a found topic must have at least 1 partition
+                assert!(partition_count > 0, "topic '{}' must have at least 1 partition, got {}", topic, partition_count);
                 return Ok(TopicMetadata { partition_count });
             }
         }

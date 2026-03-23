@@ -7,12 +7,13 @@ use crate::error::{KittError, Result};
 use tracing::debug;
 
 /// Calculate the Greatest Common Divisor of two numbers
-pub fn gcd(a: usize, b: usize) -> usize {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
+pub fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let temp = b;
+        b = a % b;
+        a = temp;
     }
+    a
 }
 
 /// Calculate the Least Common Multiple of two numbers

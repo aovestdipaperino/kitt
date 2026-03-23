@@ -197,10 +197,13 @@ impl KnightRiderAnimator {
             // Embed the MP3 file data at compile time
             const SFX_DATA: &[u8] = include_bytes!("assets/sfx.mp3");
 
+            const MAX_AUDIO_LOOPS: u64 = 100_000;
+            let mut audio_guard = 0u64;
             loop {
-                if stop_flag_clone.load(Ordering::Relaxed) {
+                if stop_flag_clone.load(Ordering::Relaxed) || audio_guard >= MAX_AUDIO_LOOPS {
                     break;
                 }
+                audio_guard += 1;
 
                 // Create a cursor from the embedded audio data
                 let cursor = Cursor::new(SFX_DATA);
