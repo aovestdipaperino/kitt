@@ -50,6 +50,9 @@ impl UiHandler {
     /// * `produce_only` - Whether running in produce-only mode
     /// * `max_backlog` - Maximum backlog threshold for percentage calculation
     pub fn new(quiet: bool, silent: bool, produce_only: bool, max_backlog: u64) -> Self {
+        // Precondition: max_backlog of 0 is only valid in produce-only mode
+        assert!(produce_only || max_backlog > 0, "UiHandler::new: max_backlog must be > 0 when not in produce-only mode");
+
         let audio_enabled = !quiet && !silent;
         Self {
             animator: KnightRiderAnimator::with_leds(LED_BAR_WIDTH).audio_enabled(audio_enabled),

@@ -53,6 +53,10 @@ impl TestHandle {
 /// - `wait()`: Async method to wait for completion
 /// - `abort()`: Method to cancel the test
 pub async fn run_test(config: TestConfig) -> Result<TestHandle> {
+    // Preconditions: broker must not be empty and duration must be positive
+    assert!(!config.broker.is_empty(), "run_test: broker address must not be empty");
+    assert!(config.duration.as_nanos() > 0, "run_test: test duration must be > 0");
+
     let (tx, rx) = mpsc::channel(EVENT_CHANNEL_SIZE);
 
     let handle = tokio::spawn(async move {
@@ -214,6 +218,9 @@ fn recalculate_threads_for_existing_topic(
 
 /// Calculate producer/consumer threads and partitions based on config
 fn calculate_thread_config(config: &TestConfig) -> Result<(usize, usize, i32)> {
+    // Precondition: at least one producer thread must be configured
+    assert!(config.producer_threads > 0, "calculate_thread_config: producer_threads must be > 0");
+
     let (num_producer_threads, num_consumer_threads, total_partitions) = if config.sticky {
         let base_threads = config.producer_threads;
         let lcm_partitions_per_thread = lcm(
@@ -278,6 +285,11 @@ async fn create_producers(
     num_producer_threads: usize,
     api_versions: &HashMap<i16, (i16, i16)>,
 ) -> Result<Vec<Producer>> {
+    // Preconditions: at least one thread must be requested and topic must not be empty
+    assert!(num_producer_threads > 0, "create_producers: num_producer_threads must be > 0");
+    assert!(!topic_name.is_empty(), "create_producers: topic_name must not be empty");
+    assert!(total_partitions > 0, "create_producers: total_partitions must be > 0");
+
     let mut producers = Vec::new();
 
     for i in 0..num_producer_threads {
@@ -309,9 +321,15 @@ async fn create_consumers(
     num_consumer_threads: usize,
     api_versions: &HashMap<i16, (i16, i16)>,
 ) -> Result<Vec<Consumer>> {
+    // Precondition: topic_name must not be empty
+    assert!(!topic_name.is_empty(), "create_consumers: topic_name must not be empty");
+
     if config.produce_only.is_some() {
         return Ok(Vec::new());
     }
+
+    // Precondition: when not in produce-only mode, must have at least one consumer thread
+    assert!(num_consumer_threads > 0, "create_consumers: num_consumer_threads must be > 0 in consume mode");
 
     let mut consumers = Vec::new();
 

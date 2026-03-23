@@ -571,6 +571,9 @@ impl KafkaClient {
 
 /// Builds a DeleteTopics request for the given topic name
 fn build_delete_topic_request(topic: &str) -> Result<DeleteTopicsRequest> {
+    // Precondition: topic name must not be empty
+    assert!(!topic.is_empty(), "topic name must not be empty for build_delete_topic_request");
+
     let mut request = DeleteTopicsRequest::default();
     request.timeout_ms = TOPIC_OPERATION_TIMEOUT_MS;
 
@@ -589,6 +592,8 @@ fn build_delete_topic_request(topic: &str) -> Result<DeleteTopicsRequest> {
             "FATAL: topic_names field is empty - this would cause '0 topics' error".to_string(),
         ));
     }
+    // Postcondition: request must have exactly one topic name
+    assert!(!request.topic_names.is_empty(), "delete request must contain at least one topic name");
 
     Ok(request)
 }
@@ -613,6 +618,9 @@ fn check_delete_response(
     response: DeleteTopicsResponse,
     topic: &str,
 ) -> Result<()> {
+    // Precondition: topic name must not be empty
+    assert!(!topic.is_empty(), "topic name must not be empty for check_delete_response");
+
     let response_count = response.responses.len();
     debug!(
         "Received delete topics response with {} results",

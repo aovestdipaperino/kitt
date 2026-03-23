@@ -82,6 +82,11 @@ impl Producer {
         key_strategy: KeyStrategy,
         messages_per_batch: usize,
     ) -> Self {
+        // Preconditions: partition count and messages_per_batch must be positive
+        assert!(producer_partitions_per_thread > 0, "producer_partitions_per_thread must be > 0, got {}", producer_partitions_per_thread);
+        assert!(messages_per_batch > 0, "messages_per_batch must be > 0, got {}", messages_per_batch);
+        assert!(!topic.is_empty(), "producer topic must not be empty");
+
         Self {
             client,
             topic,
@@ -106,6 +111,13 @@ impl Producer {
             message_validation,
             bytes_target,
         } = config;
+
+        // Precondition: either a positive duration or a bytes_target must be specified
+        assert!(
+            bytes_target.is_some() || duration.as_nanos() > 0,
+            "produce_messages requires either a positive duration or a bytes_target"
+        );
+
         let end_time = Instant::now() + duration;
 
         let partition_count = self.producer_partitions_per_thread as usize;
@@ -188,6 +200,8 @@ impl Producer {
         partition_count: usize,
         start_partition: usize,
     ) -> Result<(ProduceRequest, u64)> {
+        // Precondition: at least one partition must be targeted
+        assert!(partition_count > 0, "build_produce_request: partition_count must be > 0");
         let mut request = ProduceRequest::default();
         request.acks = -1;
         request.timeout_ms = PRODUCE_TIMEOUT_MS;
@@ -255,6 +269,9 @@ impl Producer {
         partition_id: i32,
         options: &RecordEncodeOptions,
     ) -> Result<(PartitionProduceData, u64)> {
+        // Precondition: partition_id must be non-negative
+        assert!(partition_id >= 0, "partition_id must be >= 0, got {}", partition_id);
+
         let mut records = Vec::with_capacity(self.messages_per_batch);
         let mut total_bytes = 0u64;
 
@@ -294,6 +311,9 @@ impl Producer {
         let mut partition_data = PartitionProduceData::default();
         partition_data.index = partition_id;
         partition_data.records = Some(batch);
+
+        // Postcondition: must have produced some bytes
+        assert!(total_bytes > 0, "build_partition_batch must produce at least 1 byte, got {}", total_bytes);
 
         Ok((partition_data, total_bytes))
     }

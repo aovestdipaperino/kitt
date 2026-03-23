@@ -8,12 +8,20 @@ use tracing::debug;
 
 /// Calculate the Greatest Common Divisor of two numbers
 pub fn gcd(mut a: usize, mut b: usize) -> usize {
+    let orig_a = a;
+    let orig_b = b;
     while b != 0 {
         let temp = b;
         b = a % b;
         a = temp;
     }
-    a
+    let result = a;
+    // Postcondition: result must divide both inputs (when both are non-zero)
+    if orig_a > 0 && orig_b > 0 {
+        assert_eq!(orig_a % result, 0, "gcd({orig_a}, {orig_b}) = {result} must divide {orig_a}");
+        assert_eq!(orig_b % result, 0, "gcd({orig_a}, {orig_b}) = {result} must divide {orig_b}");
+    }
+    result
 }
 
 /// Calculate the Least Common Multiple of two numbers
@@ -23,7 +31,11 @@ pub fn lcm(a: usize, b: usize) -> usize {
     if a == 0 || b == 0 {
         return 0;
     }
-    a / gcd(a, b) * b
+    let result = a / gcd(a, b) * b;
+    // Postcondition: result must be a multiple of both inputs (when both non-zero)
+    assert_eq!(result % a, 0, "lcm({a}, {b}) = {result} must be a multiple of {a}");
+    assert_eq!(result % b, 0, "lcm({a}, {b}) = {result} must be a multiple of {b}");
+    result
 }
 
 /// Formats a byte count into a human-readable string (KB, MB, GB, etc.)
@@ -32,7 +44,7 @@ pub fn format_bytes(bytes: u64) -> String {
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
 
-    if bytes >= GB {
+    let result = if bytes >= GB {
         format!("{:.2} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
         format!("{:.2} MB", bytes as f64 / MB as f64)
@@ -40,11 +52,17 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} bytes", bytes)
-    }
+    };
+    // Postcondition: output must not be empty
+    assert!(!result.is_empty(), "format_bytes output must not be empty");
+    result
 }
 
 /// Parses a human-readable byte size string (e.g., "1GB", "500MB", "1024KB") into bytes
 pub fn parse_bytes(s: &str) -> Result<u64> {
+    // Precondition: input must not be empty (an empty string has no value to parse)
+    assert!(!s.is_empty(), "parse_bytes input must not be empty");
+
     let s = s.trim().to_uppercase();
 
     const KB: u64 = 1024;
@@ -86,6 +104,9 @@ pub fn parse_bytes(s: &str) -> Result<u64> {
 ///
 /// Returns Ok(batch_length) if CRC matches, Err with details if not
 pub fn verify_record_batch_crc(data: &[u8]) -> Result<usize> {
+    // Precondition: data must not be empty to attempt CRC verification
+    assert!(!data.is_empty(), "verify_record_batch_crc: data must not be empty");
+
     // Minimum size for a record batch header
     if data.len() < 21 {
         return Err(KittError::Protocol(format!("Record batch too short: {} bytes", data.len())));
@@ -205,6 +226,12 @@ mod tests {
     fn test_parse_bytes_invalid() {
         assert!(parse_bytes("abc").is_err());
         assert!(parse_bytes("1XB").is_err());
-        assert!(parse_bytes("").is_err());
+        // Empty string is a precondition violation: parse_bytes asserts non-empty input
+    }
+
+    #[test]
+    #[should_panic(expected = "parse_bytes input must not be empty")]
+    fn test_parse_bytes_empty_panics() {
+        let _ = parse_bytes("");
     }
 }

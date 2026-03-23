@@ -59,6 +59,10 @@ impl Consumer {
         fetch_delay: u64,
         record_processing_time: u64,
     ) -> Self {
+        // Preconditions: partition count must be positive and topic must not be empty
+        assert!(consumer_partitions_per_thread > 0, "consumer_partitions_per_thread must be > 0, got {}", consumer_partitions_per_thread);
+        assert!(!topic.is_empty(), "consumer topic must not be empty");
+
         Self {
             client,
             topic,
@@ -89,6 +93,9 @@ impl Consumer {
         messages_received: Arc<AtomicU64>,
         message_validation: bool,
     ) -> Result<()> {
+        // Precondition: duration must be positive (zero-duration test makes no sense)
+        assert!(duration.as_nanos() > 0, "consume_messages duration must be > 0");
+
         // Apply fetch delay if configured
         if self.fetch_delay > 0 {
             info!(
@@ -203,6 +210,10 @@ impl Consumer {
         partition_count: usize,
         offsets: &[i64],
     ) -> (FetchRequest, i16) {
+        // Preconditions: partition_count must match offsets slice length
+        assert!(partition_count > 0, "build_fetch_request: partition_count must be > 0");
+        assert_eq!(offsets.len(), partition_count, "offsets length must equal partition_count");
+
         let mut fetch_partitions = Vec::new();
 
         // Configure fetch parameters for each assigned partition
@@ -399,6 +410,11 @@ impl Consumer {
         partition_id: usize,
         local_partition_idx: usize,
     ) -> Result<u64> {
+        // Preconditions: local_partition_idx must be within bounds of offsets
+        assert!(local_partition_idx < offsets.len(), "local_partition_idx {} out of bounds for offsets len {}", local_partition_idx, offsets.len());
+        // All offsets must be non-negative (negative offsets are invalid starting positions)
+        assert!(offsets[local_partition_idx] >= 0, "offset for partition {} must be >= 0, got {}", partition_id, offsets[local_partition_idx]);
+
         if let Some(records) = &partition_response.records {
             if !records.is_empty() {
                 let mut records_cursor = std::io::Cursor::new(records.as_ref());

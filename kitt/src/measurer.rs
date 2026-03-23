@@ -36,6 +36,9 @@ pub struct ThroughputMeasurer {
 impl ThroughputMeasurer {
     /// Creates a new ThroughputMeasurer with custom LED count and audio setting
     pub fn with_leds(led_count: usize, audio_enabled: bool) -> Self {
+        // Precondition: at least one LED required for meaningful display
+        assert!(led_count > 0, "ThroughputMeasurer::with_leds: led_count must be > 0");
+
         Self {
             messages_sent: Arc::new(AtomicU64::new(0)),
             bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -65,6 +68,12 @@ impl ThroughputMeasurer {
         produce_only: bool,
         bytes_target: Option<u64>,
     ) -> (f64, f64, Duration) {
+        // Precondition: either a positive duration or a bytes_target must be specified
+        assert!(
+            bytes_target.is_some() || duration.as_nanos() > 0,
+            "measure_quiet: requires either a positive duration or a bytes_target"
+        );
+
         // Wait for fetch delay before starting measurement
         if fetch_delay > 0 {
             tokio::time::sleep(Duration::from_secs(fetch_delay)).await;
@@ -141,6 +150,13 @@ impl ThroughputMeasurer {
         produce_only: bool,
         bytes_target: Option<u64>,
     ) -> (f64, f64, Duration) {
+        // Preconditions: label must not be empty and either duration or bytes_target must be set
+        assert!(!label.is_empty(), "measure: label must not be empty");
+        assert!(
+            bytes_target.is_some() || duration.as_nanos() > 0,
+            "measure: requires either a positive duration or a bytes_target"
+        );
+
         // Wait for fetch delay before starting measurement
         if fetch_delay > 0 {
             info!(

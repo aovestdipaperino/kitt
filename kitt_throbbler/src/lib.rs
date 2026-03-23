@@ -127,6 +127,9 @@ impl KnightRiderAnimator {
     /// let animator = KnightRiderAnimator::with_leds(30);
     /// ```
     pub fn with_leds(led_count: usize) -> Self {
+        // Precondition: must have at least one LED to display
+        assert!(led_count > 0, "with_leds: led_count must be > 0, got {}", led_count);
+
         Self {
             led_count,
             show_metrics: true,
@@ -282,6 +285,9 @@ impl KnightRiderAnimator {
     /// animator.draw_frame(5, 1, "100 msg/s (min: 50, max: 150, backlog: 1.0%)");
     /// ```
     pub fn draw_frame(&self, position: usize, direction: i32, status: &str) {
+        // Precondition: position must be within the LED bar bounds
+        assert!(position < self.led_count, "draw_frame: position {} must be < led_count {}", position, self.led_count);
+
         /// ANSI color codes for different LED intensities
         const BRIGHT_RED: &str = "\x1b[38;5;196m"; // Core bright red
         const RED: &str = "\x1b[38;5;160m"; // Standard red
@@ -385,6 +391,10 @@ impl KnightRiderAnimator {
         base_speed_ms: u64,
         status_fn: Box<dyn Fn(usize) -> String + Send + Sync>,
     ) -> AnimationHandle {
+        // Preconditions: animation speed must be positive and LED count must be at least 2
+        assert!(base_speed_ms > 0, "start_animation: base_speed_ms must be > 0, got {}", base_speed_ms);
+        assert!(self.led_count >= 2, "start_animation: led_count must be >= 2 to animate, got {}", self.led_count);
+
         let stop_flag = Arc::new(AtomicBool::new(false));
         let audio_control = self.start_audio_loop();
 
@@ -438,6 +448,10 @@ impl KnightRiderAnimator {
     /// }
     /// ```
     pub async fn run_demo(&self, duration_secs: u64, base_speed_ms: u64, max_rate_value: f64) {
+        // Preconditions: duration and speed must be positive
+        assert!(duration_secs > 0, "run_demo: duration_secs must be > 0, got {}", duration_secs);
+        assert!(base_speed_ms > 0, "run_demo: base_speed_ms must be > 0, got {}", base_speed_ms);
+
         println!("Running Knight Rider animation demo...");
         println!(
             "Duration: {}s, Base speed: {}ms, Max rate: {}, Audio: {}",
