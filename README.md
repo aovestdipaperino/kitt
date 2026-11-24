@@ -1,5 +1,7 @@
 # Kitt - Kafka Implementation Throughput Tool
 
+[![GitHub stars](https://img.shields.io/github/stars/aovestdipaperino/kitt?logo=github&color=brightgreen)](https://github.com/aovestdipaperino/kitt/stargazers)
+
 A high-performance Kafka throughput measurement tool that uses the `kafka-protocol` crate to directly connect to Kafka brokers and measure sustainable message throughput.
 
 ## Overview
